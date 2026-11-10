@@ -43,3 +43,13 @@ src/frontend/config.js
 Thumbs.db
 .idea/
 .vscode/
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+infra/prod/prod.auto.tfvars
+src/frontend/dist/
+.vercel/
