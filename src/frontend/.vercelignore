@@ -1,0 +1,4 @@
+dist
+.vercel
+docker-entrypoint.sh
+.env*

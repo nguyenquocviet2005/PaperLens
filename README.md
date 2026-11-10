@@ -24,13 +24,15 @@ src/
     evaluation/ retrieval and QA datasets/results
     migrations/ database bootstrap SQL
   frontend/     static HTML/CSS/JavaScript research workspace
-  ops/          deployment and secret-management utilities
+  ops/          AWS deployment and secret-management utilities
+infra/
+  bootstrap/    Terraform remote-state bucket (one-time)
+  prod/         Terraform for the AWS production stack
 runtime/
   data/         local SQLite data
   outputs/      local paper artifacts
 .env.example    environment template
 Dockerfile.*    CPU API, GPU API and frontend images
-cloudbuild.*    Google Cloud Build definitions
 ```
 
 ## Local setup
@@ -150,25 +152,51 @@ docker run -e PAPERLENS_API_URL=http://host.docker.internal:8000 -p 3000:8080 pa
 
 For NVIDIA L4/CUDA deployments, use `Dockerfile.backend.gpu`.
 
-## Cloud Run
+## AWS deployment
 
-The deployment script builds and deploys the API and frontend from the repository
-root:
+Production runs in `ap-northeast-1` (Tokyo) and is defined in Terraform under
+`infra/prod`:
 
-```powershell
-python src\ops\deploy_cloud_run.py both --gpu
+- `https://paperlens.ailearn-vaic.cloud`: static UI on Vercel (project `paperlens`,
+  `src/frontend/vercel.json`); Route 53 points the domain at Vercel
+- `https://api.paperlens.ailearn-vaic.cloud`: API on ECS behind an Application Load
+  Balancer. `compute_mode` in `infra/prod/prod.auto.tfvars` selects `cpu` (Fargate,
+  8 vCPU / 32 GB, `Dockerfile.backend`, the default) or `gpu` (EC2 `g6.2xlarge`
+  with an NVIDIA L4, `Dockerfile.backend.gpu`; requires G-instance quota)
+- Paper artifacts in a private S3 bucket (IAM task role, no keys)
+- `DATABASE_URL` and the LLM provider key in AWS Secrets Manager
+- LLM and embeddings through OpenRouter's OpenAI-compatible API (`llm_base_url`,
+  `llm_model` and `embedding_model` in `infra/prod/variables.tf`); if the
+  embedding provider fails, retrieval falls back to BM25
+- Supabase Postgres + Auth (Tokyo) for metadata and accounts
+
+Infrastructure changes:
+
+```bash
+terraform -chdir=infra/prod plan
+terraform -chdir=infra/prod apply
 ```
 
-After the account migration is ready, enable account mode with:
+Runtime secrets (read from `.env`: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+`PROD_DATABASE_URL`; values are never printed):
 
-```powershell
-python src\ops\deploy_cloud_run.py both --gpu --enable-auth `
-  --supabase-auth-url "https://YOUR_PROJECT.supabase.co" `
-  --supabase-anon-key "$env:SUPABASE_PUBLISHABLE_KEY"
+```bash
+python src/ops/put_aws_secrets.py
 ```
 
-Required secrets are expected in Google Secret Manager. The helper scripts under
-`src/ops/` can create/update those references without printing secret values.
+Release a new version from the repository root:
+
+```bash
+python src/ops/deploy_aws.py both          # or: api | ui
+python src/ops/deploy_aws.py api --tag <existing-ecr-tag>
+```
+
+The deployed API image tag is stored in the SSM parameter
+`/paperlens/prod/api-image-tag`, so a plain `terraform apply` never reverts the
+running version. Non-secret Terraform inputs (alarm email, compute mode) go in
+the gitignored `infra/prod/prod.auto.tfvars`; see `prod.auto.tfvars.example`.
+The UI's runtime config (`PAPERLENS_API_URL`, `SUPABASE_AUTH_URL`,
+`SUPABASE_PUBLISHABLE_KEY`) is set as Vercel project environment variables.
 
 ## Core stack
 
@@ -177,5 +205,5 @@ Required secrets are expected in Google Secret Manager. The helper scripts under
 - LangChain chunking, embeddings, PGVector, BM25 and grounded QA
 - LangGraph research orchestration and tool-calling agent
 - OpenAI-compatible LLM/VLM providers
-- Google Cloud Storage and Cloud Run
+- AWS (ECS, ALB, S3, Secrets Manager, CodeBuild, CloudWatch) via Terraform; Vercel for the UI
 - Static JavaScript frontend with streaming Markdown, KaTeX and SVG plots
