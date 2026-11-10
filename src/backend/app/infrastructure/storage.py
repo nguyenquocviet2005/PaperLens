@@ -141,23 +141,33 @@ class LocalStorage(StorageBackend):
             path.unlink()
 
 
-class GCSStorage(StorageBackend):
-    """Google Cloud Storage backend using Application Default Credentials."""
+class S3Storage(StorageBackend):
+    """Amazon S3 backend using the default AWS credential chain (IAM task role in ECS)."""
 
-    def __init__(self, bucket_name: str, project_id: str | None = None) -> None:
-        try:
-            from google.cloud import storage
-        except ImportError as exc:  # pragma: no cover
-            raise StorageError("google-cloud-storage is required for GCS backend") from exc
+    def __init__(self, bucket_name: str, region: str | None = None, client: Any | None = None) -> None:
+        if client is None:
+            try:
+                import boto3
+            except ImportError as exc:  # pragma: no cover
+                raise StorageError("boto3 is required for S3 backend") from exc
+            client = boto3.client("s3", region_name=region)
 
         self.bucket_name = bucket_name
-        self.client = storage.Client(project=project_id)
-        self.bucket = self.client.bucket(bucket_name)
+        self.client = client
+
+    @staticmethod
+    def _is_missing(exc: Exception) -> bool:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+        return code in {"404", "NoSuchKey", "NotFound"}
 
     def save_bytes(self, key: str, data: bytes, content_type: str | None = None) -> str:
         normalized = _normalize_key(key)
-        blob = self.bucket.blob(normalized)
-        blob.upload_from_string(data, content_type=content_type or "application/octet-stream")
+        self.client.put_object(
+            Bucket=self.bucket_name,
+            Key=normalized,
+            Body=data,
+            ContentType=content_type or "application/octet-stream",
+        )
         return normalized
 
     def save_text(self, key: str, text: str, encoding: str = "utf-8") -> str:
@@ -173,30 +183,42 @@ class GCSStorage(StorageBackend):
 
     def read_bytes(self, key: str) -> bytes:
         normalized = _normalize_key(key)
-        blob = self.bucket.blob(normalized)
-        if not blob.exists():
-            raise ObjectNotFoundError(key)
-        return blob.download_as_bytes()
+        try:
+            response = self.client.get_object(Bucket=self.bucket_name, Key=normalized)
+        except Exception as exc:
+            if self._is_missing(exc):
+                raise ObjectNotFoundError(key) from exc
+            raise
+        return response["Body"].read()
 
     def exists(self, key: str) -> bool:
-        return self.bucket.blob(_normalize_key(key)).exists()
+        try:
+            self.client.head_object(Bucket=self.bucket_name, Key=_normalize_key(key))
+        except Exception as exc:
+            if self._is_missing(exc):
+                return False
+            raise
+        return True
 
     def list_objects(self, prefix: str = "") -> list[str]:
         normalized = _normalize_key(prefix) if prefix else ""
-        return sorted(blob.name for blob in self.client.list_blobs(self.bucket, prefix=normalized))
+        paginator = self.client.get_paginator("list_objects_v2")
+        results: list[str] = []
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=normalized):
+            results.extend(item["Key"] for item in page.get("Contents", []))
+        return sorted(results)
 
     def delete_object(self, key: str) -> None:
-        normalized = _normalize_key(key)
-        blob = self.bucket.blob(normalized)
-        if blob.exists():
-            blob.delete()
+        self.client.delete_object(Bucket=self.bucket_name, Key=_normalize_key(key))
 
 
 def get_storage(settings: Settings | None = None) -> StorageBackend:
     cfg = settings or get_settings()
-    if cfg.storage_backend == "gcs":
-        logger.info("Using GCS storage backend bucket=%s", cfg.gcs_bucket_name)
-        return GCSStorage(bucket_name=cfg.gcs_bucket_name, project_id=cfg.gcp_project_id)
+    if cfg.storage_backend == "s3":
+        if not cfg.s3_bucket_name:
+            raise StorageError("S3_BUCKET_NAME is required when STORAGE_BACKEND=s3")
+        logger.info("Using S3 storage backend bucket=%s", cfg.s3_bucket_name)
+        return S3Storage(bucket_name=cfg.s3_bucket_name, region=cfg.aws_region)
     root = cfg.local_storage_root
     if not root.is_absolute():
         root = Path.cwd() / root

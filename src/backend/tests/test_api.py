@@ -116,12 +116,23 @@ def test_cloud_ui_cors_preflight(client):
     response = client.options(
         "/papers",
         headers={
-            "Origin": "https://paperlens-ui-uopctebpeq-as.a.run.app",
+            "Origin": "https://paperlens.ailearn-vaic.cloud",
             "Access-Control-Request-Method": "GET",
         },
     )
     assert response.status_code == 200
-    assert response.headers["access-control-allow-origin"].startswith("https://paperlens-ui-")
+    assert response.headers["access-control-allow-origin"] == "https://paperlens.ailearn-vaic.cloud"
+
+
+def test_foreign_origin_cors_preflight_rejected(client):
+    response = client.options(
+        "/papers",
+        headers={
+            "Origin": "https://paperlens-ui-uopctebpeq-as.a.run.app",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert "access-control-allow-origin" not in response.headers
 
 
 def test_invalid_extension(client):

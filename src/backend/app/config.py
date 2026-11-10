@@ -26,11 +26,11 @@ class Settings(BaseSettings):
     app_host: str = "127.0.0.1"
     app_port: int = 8000
 
-    storage_backend: Literal["local", "gcs"] = "local"
+    storage_backend: Literal["local", "s3"] = "local"
     local_storage_root: Path = Path("runtime/outputs")
 
-    gcp_project_id: str = "paperlens-dev-26"
-    gcs_bucket_name: str = "paperlens-dev-26-paper-storage"
+    s3_bucket_name: str = ""
+    aws_region: str | None = None
 
     docling_ocr_mode: Literal["off", "on", "auto"] = "auto"
     docling_images_scale: float = 1.5
@@ -109,6 +109,10 @@ class Settings(BaseSettings):
     )
     embedding_base_url: str | None = None
     embedding_dimensions: int = 384
+    # Self-hosted servers (e.g. TEI) serve fixed-size models and may reject `dimensions`.
+    embedding_send_dimensions: bool = True
+    # Texts per embeddings request; TEI caps client batches (32 by default).
+    embedding_batch_size: int | None = None
     retrieval_top_k: int = 8
     retrieval_use_mmr: bool = False
 
@@ -129,11 +133,10 @@ class Settings(BaseSettings):
     paperlens_api_base: str = "http://127.0.0.1:8000"
     cors_allowed_origins: str = (
         "http://127.0.0.1:3000,http://localhost:3000,"
-        "http://127.0.0.1:8080,http://localhost:8080"
+        "http://127.0.0.1:8080,http://localhost:8080,"
+        "https://paperlens.ailearn-vaic.cloud"
     )
-    cors_allow_origin_regex: str = (
-        r"https://paperlens-ui-[a-z0-9-]+\.(?:a\.run\.app|asia-southeast1\.run\.app)"
-    )
+    cors_allow_origin_regex: str = ""
     langsmith_enabled: bool = False
     langsmith_tracing: bool = False
     allow_paid_evaluation: bool = False

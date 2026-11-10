@@ -43,10 +43,16 @@ def get_embeddings(settings: Settings | None = None) -> tuple[Embeddings, str]:
         kwargs: dict[str, Any] = {
             "model": cfg.embedding_model,
             "api_key": cfg.embedding_api_key,
-            "dimensions": cfg.embedding_dimensions,
         }
+        if cfg.embedding_send_dimensions:
+            kwargs["dimensions"] = cfg.embedding_dimensions
+        if cfg.embedding_batch_size:
+            kwargs["chunk_size"] = cfg.embedding_batch_size
         if cfg.embedding_base_url:
             kwargs["base_url"] = cfg.embedding_base_url
+            # OpenAI-compatible providers (OpenRouter, TEI, vLLM) expect raw strings, not the
+            # tiktoken token arrays LangChain sends to api.openai.com by default.
+            kwargs["check_embedding_ctx_length"] = False
         return OpenAIEmbeddings(**kwargs), cfg.embedding_model
     raise EmbeddingError(f"Unknown embedding provider: {provider}")
 

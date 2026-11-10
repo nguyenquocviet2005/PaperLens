@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
 from sqlalchemy import select
 
 from app.config import Settings, get_settings
@@ -33,6 +35,26 @@ def _row_document(row: PaperChunk) -> Document:
     }
     metadata["citation"] = _citation_label(metadata)
     return Document(page_content=row.content, metadata=metadata)
+
+
+class _SparseFallbackRetriever(BaseRetriever):
+    """Hybrid retriever that degrades to BM25 when the embedding provider fails at query time.
+
+    Embedding errors (rate limits, exhausted credits, provider outages) surface on
+    `invoke`, not when the vector store is constructed, so they need handling here.
+    """
+
+    primary: Any
+    sparse: Any
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        try:
+            return self.primary.invoke(query, config={"callbacks": run_manager.get_child()})
+        except Exception as exc:
+            logger.warning("Dense retrieval failed; falling back to BM25: %s", type(exc).__name__)
+            return self.sparse.invoke(query, config={"callbacks": run_manager.get_child()})
 
 
 def _build_retriever(
@@ -79,14 +101,12 @@ def _build_retriever(
 
     from langchain_classic.retrievers import EnsembleRetriever
 
-    return (
-        EnsembleRetriever(
-            retrievers=retrievers,
-            weights=weights,
-            id_key="chunk_id",
-        ),
-        source,
+    ensemble = EnsembleRetriever(
+        retrievers=retrievers,
+        weights=weights,
+        id_key="chunk_id",
     )
+    return _SparseFallbackRetriever(primary=ensemble, sparse=sparse), source
 
 
 def get_langchain_retriever(

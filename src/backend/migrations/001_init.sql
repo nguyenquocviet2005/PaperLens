@@ -1,5 +1,5 @@
 -- PaperLens metadata schema (PostgreSQL / Supabase)
--- Binary PDFs and images remain in object storage (GCS/local), not in these tables.
+-- Binary PDFs and images remain in object storage (S3/local), not in these tables.
 -- Applied automatically via SQLAlchemy Base.metadata.create_all for local SQLite.
 -- For Supabase, run create_all against DATABASE_URL or adapt to hosted migrations.
 
