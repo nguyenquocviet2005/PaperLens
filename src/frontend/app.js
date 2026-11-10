@@ -226,6 +226,37 @@ async function loadCapabilities() {
     /* Capabilities are optional for local bootstrapping. */
   }
 }
+// Supabase email links (signup confirmation, magic link, recovery) redirect back with the
+// session or an error in the URL fragment. Consume it before the hash router sees it.
+async function consumeAuthRedirect() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  if (!params.has("access_token") && !params.has("error_description")) return;
+  history.replaceState(null, "", location.pathname + location.search);
+  if (params.has("error_description")) {
+    toast(params.get("error_description").replace(/\+/g, " "), "error");
+    return;
+  }
+  if (!AUTH_CONFIGURED) return;
+  const expiresIn = Number(params.get("expires_in") || 3600);
+  const session = {
+    access_token: params.get("access_token"),
+    refresh_token: params.get("refresh_token"),
+    token_type: params.get("token_type") || "bearer",
+    expires_in: expiresIn,
+    expires_at: Number(params.get("expires_at")) || Math.floor(Date.now() / 1000) + expiresIn,
+  };
+  try {
+    const response = await fetch(`${AUTH_URL}/auth/v1/user`, {
+      headers: { "apikey": AUTH_ANON_KEY, "Authorization": `Bearer ${session.access_token}` }
+    });
+    if (!response.ok) throw new Error(`Could not load your account (${response.status})`);
+    session.user = await response.json();
+    storeAuthSession(session);
+    toast(params.get("type") === "signup" ? "Email confirmed. You're signed in." : "You're signed in.", "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
 function initializeAuth() {
   renderAccount();
   if (AUTH_CONFIGURED && !state.authSession) {
@@ -907,6 +938,7 @@ $("#auth-guest").addEventListener("click",()=>continueAsGuest());
 $("#account-button").addEventListener("click",()=>{storeAuthSession(null);state.papers=[];state.agentSessions=[];state.guestQuota=null;startNewAgentConversation();renderAccount();$("#auth-modal").classList.remove("hidden");});
 
 (async function init(){
+  await consumeAuthRedirect();
   navigate(location.hash.slice(1)||"home");
   await loadCapabilities();
   const authenticated = initializeAuth();
