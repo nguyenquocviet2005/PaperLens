@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 
 from langchain_core.messages import (
@@ -137,15 +138,24 @@ def deserialize_message(record: dict[str, Any]) -> BaseMessage:
     return HumanMessage(content=content)
 
 
-def load_history(
+@dataclass
+class StoredConversation:
+    messages: list[BaseMessage] = field(default_factory=list)
+    summary: str | None = None
+    summarized_turns: int = 0
+    state: dict[str, Any] | None = None
+
+
+def load_conversation(
     conversation_id: str, settings: Settings, *, user_id: str = "local-user"
-) -> list[BaseMessage]:
+) -> StoredConversation:
+    """Full stored history plus the conversation memory (summary and state)."""
     try:
         with session_scope(settings) as session:
             repo = AgentConversationRepository(session)
             conversation = repo.get_with_messages(conversation_id, user_id=user_id)
             if conversation is None:
-                return []
+                return StoredConversation()
             records = [
                 {
                     "role": m.role,
@@ -159,10 +169,22 @@ def load_history(
                 }
                 for m in conversation.messages
             ]
+            stored = StoredConversation(
+                summary=conversation.context_summary,
+                summarized_turns=int(conversation.summarized_turns or 0),
+                state=dict(conversation.context_state or {}) or None,
+            )
     except Exception:
         logger.exception("Failed to load agent conversation %s", conversation_id)
-        return []
-    return [deserialize_message(item) for item in records]
+        return StoredConversation()
+    stored.messages = [deserialize_message(item) for item in records]
+    return stored
+
+
+def load_history(
+    conversation_id: str, settings: Settings, *, user_id: str = "local-user"
+) -> list[BaseMessage]:
+    return load_conversation(conversation_id, settings, user_id=user_id).messages
 
 
 def save_history(
@@ -173,7 +195,9 @@ def save_history(
     settings: Settings,
     human_image: ValidatedImage | None = None,
     user_id: str = "local-user",
+    kind: str = "agent",
 ) -> None:
+    """Append the messages of one turn (the new human message and what followed)."""
     records = [serialize_message(m) for m in messages]
     # Attach image metadata to the latest human turn without storing bytes.
     if human_image is not None:
@@ -187,15 +211,33 @@ def save_history(
                 break
     try:
         with session_scope(settings) as session:
-            AgentConversationRepository(session).replace_messages(
+            AgentConversationRepository(session).append_messages(
                 conversation_id,
                 records,
                 selected_papers=selected_papers,
-                keep_last=settings.agent_history_limit,
                 user_id=user_id,
+                kind=kind,
+                max_messages=settings.agent_history_limit,
             )
     except Exception:
         logger.exception("Failed to persist agent conversation %s", conversation_id)
+
+
+def save_memory(
+    conversation_id: str,
+    settings: Settings,
+    *,
+    state: dict[str, Any] | None = None,
+    summary: str | None = None,
+    summarized_turns: int | None = None,
+) -> None:
+    try:
+        with session_scope(settings) as session:
+            AgentConversationRepository(session).update_memory(
+                conversation_id, state=state, summary=summary, summarized_turns=summarized_turns
+            )
+    except Exception:
+        logger.exception("Failed to persist conversation memory %s", conversation_id)
 
 
 def get_agent_conversation(

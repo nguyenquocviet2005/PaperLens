@@ -145,7 +145,7 @@ def node_retrieve_evidence(state: ResearchState, settings: Settings) -> Research
             evidence.append(
                 {
                     "paper_id": paper_id,
-                    "claim": item.get("content", "")[:500],
+                    "claim": (item.get("matched_text") or item.get("content", ""))[:500],
                     "citation": item.get("citation"),
                     "chunk_id": item.get("chunk_id"),
                     "page": item.get("page_start"),
@@ -222,7 +222,7 @@ def node_synthesize(state: ResearchState, settings: Settings) -> ResearchState:
     selected = state.get("selected_papers") or []
     question = state.get("clarified_question") or ""
     lines = [
-        f"# Research report",
+        "# Research report",
         "",
         f"**Question:** {question}",
         "",

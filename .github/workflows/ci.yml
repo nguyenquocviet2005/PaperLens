@@ -1,0 +1,86 @@
+name: CI
+
+# Pull requests and feature branches. Pushes to master run the same jobs from
+# deploy.yml (workflow_call), so a release never ships untested code.
+on:
+  pull_request:
+  push:
+    branches-ignore: [master]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/master' }}
+
+jobs:
+  backend:
+    name: Backend tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: src/backend/pyproject.toml
+
+      - name: Install (CPU-only torch keeps this to a few minutes)
+        run: >
+          uv pip install --system -e "src/backend[dev]"
+          --extra-index-url https://download.pytorch.org/whl/cpu
+          --index-strategy unsafe-best-match
+
+      - name: Lint (errors only)
+        run: uvx ruff check --select F,E9 src/backend/app src/backend/tests src/ops
+
+      - name: Tests
+        working-directory: src/backend
+        env:
+          # Tests must never reach a real provider or database.
+          ALLOW_EXTERNAL_API: "false"
+          LLM_ENABLED: "false"
+          LUNA_ENABLED: "false"
+          METRICS_ENABLED: "false"
+        run: python -m pytest -q -p no:cacheprovider
+
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Syntax
+        run: |
+          node --check src/frontend/app.js
+          sh -n src/frontend/vercel-build.sh
+          python3 -c "import json; json.load(open('src/frontend/vercel.json'))"
+
+  terraform:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.1"
+      - run: terraform fmt -check -recursive infra
+      - name: Validate prod
+        run: |
+          terraform -chdir=infra/prod init -backend=false -input=false
+          terraform -chdir=infra/prod validate
+      - name: Validate bootstrap
+        run: |
+          terraform -chdir=infra/bootstrap init -backend=false -input=false
+          terraform -chdir=infra/bootstrap validate

@@ -332,7 +332,7 @@ def test_stream_agent_filters_nested_tool_model_tokens(
     agent_settings: Settings, monkeypatch
 ):
     class FakeGraph:
-        def stream(self, inputs, stream_mode):
+        def stream(self, inputs, stream_mode, config=None):
             yield (
                 "messages",
                 (

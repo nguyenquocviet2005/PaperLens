@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Sequence
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -13,7 +14,8 @@ from sqlalchemy import select
 from app.config import Settings, get_settings
 from app.db.models import Paper, PaperChunk
 from app.db.session import session_scope
-from app.rag.embeddings import get_embeddings, get_vector_store
+from app.infrastructure.observability import emit_metrics
+from app.rag.embeddings import PARENT_CHUNK_TYPE, get_embeddings, get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,19 @@ def _build_retriever(
     return _SparseFallbackRetriever(primary=ensemble, sparse=sparse), source
 
 
+def _searchable(row: PaperChunk) -> bool:
+    return row.chunk_type != PARENT_CHUNK_TYPE
+
+
+def _chunk_query(paper_id: str | None, user_id: str | None):
+    stmt = select(PaperChunk)
+    if user_id is not None:
+        stmt = stmt.join(Paper, Paper.id == PaperChunk.paper_id).where(Paper.user_id == user_id)
+    if paper_id:
+        stmt = stmt.where(PaperChunk.paper_id == paper_id)
+    return stmt
+
+
 def get_langchain_retriever(
     *,
     paper_id: str | None,
@@ -117,17 +132,14 @@ def get_langchain_retriever(
     use_mmr: bool = False,
     user_id: str | None = None,
 ):
-    """Build the native LangChain retriever consumed by QA chains and LangGraph tools."""
+    """Native LangChain retriever over the searchable (child) chunks."""
     cfg = settings or get_settings()
     with session_scope(cfg) as session:
-        stmt = select(PaperChunk)
-        if user_id is not None:
-            stmt = stmt.join(Paper, Paper.id == PaperChunk.paper_id).where(
-                Paper.user_id == user_id
-            )
-        if paper_id:
-            stmt = stmt.where(PaperChunk.paper_id == paper_id)
-        documents = [_row_document(row) for row in session.scalars(stmt)]
+        documents = [
+            _row_document(row)
+            for row in session.scalars(_chunk_query(paper_id, user_id))
+            if _searchable(row)
+        ]
     if not documents:
         return None, "none", 0
     retriever, source = _build_retriever(
@@ -140,6 +152,12 @@ def get_langchain_retriever(
     return retriever, source, len(documents)
 
 
+def _count_tokens(text: str) -> int:
+    from app.ingestion.surrounding import count_tokens
+
+    return count_tokens(text)
+
+
 def retrieve(
     query: str,
     *,
@@ -148,42 +166,44 @@ def retrieve(
     top_k: int = 8,
     candidate_pool: int = 40,
     use_mmr: bool = False,
-    expand_parents: bool = True,
+    expand_parents: bool | None = None,
+    max_evidence_tokens: int | None = None,
     user_id: str | None = None,
 ) -> dict[str, Any]:
+    """Hybrid search over child chunks, returned as at most `top_k` evidence units.
+
+    Small-to-big: a matching text child is replaced by its parent passage, and several
+    children of one parent collapse into a single unit (pages come from the children that
+    matched). Tables, figures and equations are their own unit. Units stop once the
+    evidence token budget is used, but the first unit is always returned.
+    """
     cfg = settings or get_settings()
+    started = time.perf_counter()
+    expand = cfg.retrieval_expand_parents if expand_parents is None else expand_parents
+    budget = max_evidence_tokens or cfg.retrieval_max_evidence_tokens
     q = normalize_query(query)
     if not q:
         return {"query": query, "results": [], "diagnostics": {"error": "empty_query"}}
 
     with session_scope(cfg) as session:
-        stmt = select(PaperChunk)
-        if user_id is not None:
-            stmt = stmt.join(Paper, Paper.id == PaperChunk.paper_id).where(
-                Paper.user_id == user_id
-            )
-        if paper_id:
-            stmt = stmt.where(PaperChunk.paper_id == paper_id)
-        rows = list(session.scalars(stmt))
-        documents = [_row_document(row) for row in rows]
-        parent_snapshots = {
+        rows = list(session.scalars(_chunk_query(paper_id, user_id)))
+        documents = [_row_document(row) for row in rows if _searchable(row)]
+        parents = {
             row.id: {
                 "content": row.content,
+                "section_path": list(row.section_path or []),
                 "page_start": row.page_start,
                 "page_end": row.page_end,
             }
             for row in rows
+            if not _searchable(row)
         }
 
-    if not rows:
+    if not documents:
         return {
             "query": q,
             "results": [],
-            "diagnostics": {
-                "returned": 0,
-                "paper_id": paper_id,
-                "retriever": "none",
-            },
+            "diagnostics": {"returned": 0, "paper_id": paper_id, "retriever": "none"},
         }
 
     retriever, source = _build_retriever(
@@ -193,42 +213,73 @@ def retrieve(
         candidate_pool=candidate_pool,
         use_mmr=use_mmr,
     )
-    allowed_chunk_ids = set(parent_snapshots)
-    selected = [
-        document
-        for document in retriever.invoke(q)
-        if str(document.metadata.get("chunk_id") or "") in allowed_chunk_ids
-    ][:top_k]
-    results: list[dict[str, Any]] = []
-    for rank, document in enumerate(selected, start=1):
+    searchable_ids = {str(d.metadata["chunk_id"]) for d in documents}
+    hits = [d for d in retriever.invoke(q) if str(d.metadata.get("chunk_id") or "") in searchable_ids]
+
+    units: dict[str, dict[str, Any]] = {}
+    used_tokens = 0
+    budget_stopped = False
+    for document in hits:
         metadata = dict(document.metadata)
         parent_id = metadata.get("parent_chunk_id")
-        if expand_parents and parent_id in parent_snapshots:
-            parent = parent_snapshots[parent_id]
-            metadata["parent_content_preview"] = str(parent["content"])[:500]
-            metadata["parent_pages"] = [parent["page_start"], parent["page_end"]]
-        result = {
-            "chunk_id": str(metadata.get("chunk_id") or ""),
+        parent = parents.get(parent_id) if expand and parent_id else None
+        unit_id = str(parent_id if parent else metadata["chunk_id"])
+        pages = [p for p in (metadata.get("page_start"), metadata.get("page_end")) if p is not None]
+        if unit_id in units:
+            unit = units[unit_id]
+            unit["metadata"]["matched_chunk_ids"].append(metadata["chunk_id"])
+            unit["_pages"].update(pages)
+            continue
+        if len(units) >= top_k:
+            continue
+        content = str(parent["content"]) if parent else document.page_content
+        tokens = _count_tokens(content)
+        if units and used_tokens + tokens > budget:
+            budget_stopped = True
+            continue
+        used_tokens += tokens
+        metadata["matched_chunk_ids"] = [metadata["chunk_id"]]
+        metadata["expanded_to_parent"] = bool(parent)
+        units[unit_id] = {
+            "chunk_id": unit_id,
             "paper_id": str(metadata.get("paper_id") or ""),
-            "content": document.page_content,
+            "content": content,
+            "matched_text": document.page_content,
             "chunk_type": str(metadata.get("chunk_type") or "text"),
-            "section_path": list(metadata.get("section_path") or []),
-            "page_start": metadata.get("page_start"),
-            "page_end": metadata.get("page_end"),
-            "score": 1.0 / rank,
+            "section_path": list((parent or metadata).get("section_path") or []),
             "metadata": metadata,
             "parent_chunk_id": parent_id,
             "sources": [source],
+            "_pages": set(pages),
         }
-        result["citation"] = _citation_label(result)
-        results.append(result)
+
+    results: list[dict[str, Any]] = []
+    for rank, unit in enumerate(units.values(), start=1):
+        pages = sorted(unit.pop("_pages"))
+        unit["page_start"] = pages[0] if pages else None
+        unit["page_end"] = pages[-1] if pages else None
+        unit["score"] = 1.0 / rank
+        results.append(unit)
+    _assign_citation_labels(results)
+    emit_metrics(
+        {
+            "RetrievalLatency": (round((time.perf_counter() - started) * 1000, 1), "Milliseconds"),
+            "EvidenceTokens": (used_tokens, "Count"),
+            "RetrievalEmpty": (0 if results else 1, "Count"),
+        },
+        dimensions={"Retriever": source},
+    )
 
     return {
         "query": q,
         "results": results,
         "diagnostics": {
             "corpus_size": len(documents),
+            "candidates": len(hits),
             "returned": len(results),
+            "evidence_tokens": used_tokens,
+            "budget_stopped": budget_stopped,
+            "expand_parents": expand,
             "mmr": use_mmr,
             "paper_id": paper_id,
             "retriever": source,
@@ -255,6 +306,23 @@ def _citation_label(item: dict[str, Any]) -> str:
         return f"[Section {section}]"
     chunk_id = str(item.get("chunk_id") or "")
     return f"[Chunk {chunk_id[:8]}]"
+
+
+def _assign_citation_labels(results: list[dict[str, Any]]) -> None:
+    """Give each result a label no other result in the list shares.
+
+    Labels are how the LLM points at evidence, so two chunks with the same page and
+    section must still be told apart: a short id is appended, lengthened on collision.
+    """
+    for width in (4, 6, 8, 36):
+        labels = [
+            _citation_label(item)[:-1] + f" #{str(item['chunk_id']).replace('-', '')[:width]}]"
+            for item in results
+        ]
+        if len(set(labels)) == len(labels):
+            break
+    for item, label in zip(results, labels):
+        item["citation"] = label
 
 
 def evaluate_retrieval(

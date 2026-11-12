@@ -161,6 +161,12 @@ resource "aws_secretsmanager_secret" "llm_api_key" {
   recovery_window_in_days = 7
 }
 
+# LangSmith tracing key; put a value before setting langsmith_enabled = true.
+resource "aws_secretsmanager_secret" "langsmith_api_key" {
+  name                    = "paperlens/prod/langsmith-api-key"
+  recovery_window_in_days = 7
+}
+
 resource "aws_secretsmanager_secret" "database_url" {
   name                    = "paperlens/prod/database-url"
   recovery_window_in_days = 7

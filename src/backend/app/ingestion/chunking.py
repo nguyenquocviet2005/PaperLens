@@ -5,9 +5,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Iterable
 
-from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.db.models import PaperChunk
@@ -55,6 +55,28 @@ class ChunkingConfig:
     child_min_tokens: int = 250
     child_max_tokens: int = 450
     overlap_tokens: int = 55
+    # A short last child is merged into the previous one only if the result stays under
+    # this size; bge-small (the production embedder) reads at most 512 tokens.
+    child_hard_max_tokens: int = 500
+    # Raw table data appended to table chunks (characters).
+    table_data_max_chars: int = 4000
+
+
+PARENT_CHUNK_TYPE = "parent_passage"
+VISUAL_CHUNK_TYPES = frozenset({"table", "figure", "equation"})
+_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
+_SPLITTER = "langchain_recursive_tiktoken"
+
+
+@lru_cache(maxsize=1)
+def _encoding():
+    import tiktoken
+
+    return tiktoken.get_encoding("gpt2")  # the encoding LangChain's tiktoken splitter uses
+
+
+def _bpe_tokens(text: str) -> int:
+    return len(_encoding().encode(text or ""))
 
 
 def _group_text_by_section(elements: Iterable[TextElement]) -> list[tuple[tuple[str, ...], list[TextElement]]]:
@@ -85,111 +107,194 @@ def _pages_of(elements: list[TextElement]) -> tuple[int | None, int | None]:
     return min(pages), max(pages)
 
 
+@dataclass
+class _ParentDraft:
+    sections: list[list[str]] = field(default_factory=list)
+    elements: list[TextElement] = field(default_factory=list)
+    text: str = ""
+    tokens: int = 0
+
+    def absorb(self, sections: list[list[str]], elements: list[TextElement], text: str) -> None:
+        self.sections.extend(sections)
+        self.elements.extend(elements)
+        self.text = f"{self.text}\n\n{text}".strip()
+        self.tokens = _bpe_tokens(self.text)
+
+
+def _build_parents(paper: PaperDocument, cfg: ChunkingConfig) -> list[_ParentDraft]:
+    """Merge consecutive short sections until a parent reaches parent_min_tokens.
+
+    Never merges past parent_max_tokens; a single section above the maximum is split on
+    its own. A short final parent is folded into the previous one when it fits.
+    """
+    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=cfg.parent_max_tokens, chunk_overlap=0, separators=_SEPARATORS
+    )
+    parents: list[_ParentDraft] = []
+    current: _ParentDraft | None = None
+    for path, elems in _group_text_by_section(paper.text_elements):
+        body = "\n\n".join(el.text for el in elems if el.text).strip()
+        if not body:
+            continue
+        size = _bpe_tokens(body)
+        if size > cfg.parent_max_tokens:
+            if current:
+                parents.append(current)
+                current = None
+            for piece in splitter.split_text(body):
+                part = _ParentDraft()
+                part.absorb([list(path)], [el for el in elems if el.text and el.text[:60] in piece] or elems, piece)
+                parents.append(part)
+            continue
+        if current and (
+            current.tokens >= cfg.parent_min_tokens
+            or current.tokens + size > cfg.parent_max_tokens
+        ):
+            parents.append(current)
+            current = None
+        current = current or _ParentDraft()
+        current.absorb([list(path)], elems, body)
+    if current:
+        parents.append(current)
+    if (
+        len(parents) > 1
+        and parents[-1].tokens < cfg.parent_min_tokens
+        and parents[-2].tokens + parents[-1].tokens <= cfg.parent_max_tokens
+    ):
+        tail = parents.pop()
+        parents[-1].absorb(tail.sections, tail.elements, tail.text)
+    return parents
+
+
+def _child_pages(text: str, elements: list[TextElement]) -> tuple[int | None, int | None]:
+    """Pages of the elements whose text appears in this child (citations stay precise
+    even when a merged parent spans several pages)."""
+    inside = [el for el in elements if el.text and el.text[:60] in text]
+    return _pages_of(inside or elements)
+
+
+def _split_children(text: str, cfg: ChunkingConfig) -> list[str]:
+    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        chunk_size=cfg.child_max_tokens, chunk_overlap=cfg.overlap_tokens, separators=_SEPARATORS
+    )
+    pieces = splitter.split_text(text)
+    if len(pieces) > 1 and _bpe_tokens(pieces[-1]) < cfg.child_min_tokens:
+        merged = f"{pieces[-2]} {pieces[-1]}"
+        if _bpe_tokens(merged) <= cfg.child_hard_max_tokens:
+            pieces[-2:] = [merged]
+    return pieces
+
+
+MODEL_TEXT_LABEL = "[Model-generated description]"
+
+
+def luna_summary(visual: VisualElement) -> str:
+    """Short, labelled text from a completed Luna enrichment (empty when there is none)."""
+    enrichment = visual.enrichment
+    result = enrichment.result if enrichment and enrichment.status == "completed" else None
+    if not result:
+        return ""
+    if visual.type == "table":
+        parts = [result.get("table_purpose", ""), *list(result.get("main_results") or [])[:4]]
+    elif visual.type == "figure":
+        parts = [result.get("description", ""), result.get("main_message", "")]
+    else:
+        parts = [result.get("latex", ""), result.get("plain_reading", ""), result.get("explanation", "")]
+    text = " ".join(str(p) for p in parts if p)
+    return f"{MODEL_TEXT_LABEL} {text}" if text else ""
+
+
+def visual_chunk_content(visual: VisualElement, cfg: ChunkingConfig) -> str:
+    """Caption, transcription, Luna description, context paragraphs, then raw table data.
+
+    The order matters: the embedder reads only the first ~512 tokens, so the most
+    descriptive parts come first and long table data last.
+    """
+    formula_text = visual.docling_text if visual.type == "formula" else ""
+    table_data = ""
+    if visual.type == "table" and visual.docling_text:
+        table_data = "[Table data]\n" + visual.docling_text[: cfg.table_data_max_chars]
+    parts = [
+        visual.caption or "",
+        formula_text or "",
+        luna_summary(visual),
+        " ".join(visual.surrounding_text or []),
+        table_data,
+    ]
+    return "\n\n".join(p.strip() for p in parts if p and p.strip())
+
+
 def chunk_paper_document(
     paper: PaperDocument,
     *,
     config: ChunkingConfig | None = None,
 ) -> ChunkingResult:
-    """Build LangChain-split parent/child documents plus visual retrieval records."""
+    """Small-to-big chunks: parents are stored for the LLM, children are indexed.
+
+    Text: consecutive sections are merged into parents of parent_min..parent_max tokens,
+    and each parent is split into children of at most child_max tokens. Tables, figures
+    and equations are standalone indexed chunks (their own "parent").
+    """
     cfg = config or ChunkingConfig()
     parents: list[ChunkDraft] = []
     children: list[ChunkDraft] = []
 
-    section_groups = _group_text_by_section(paper.text_elements)
-    source_documents: list[Document] = []
-    for path, elems in section_groups:
-        text = "\n\n".join(el.text for el in elems if el.text).strip()
-        if not text:
-            continue
-        page_start, page_end = _pages_of(elems)
-        source_documents.append(
-            Document(
-                page_content=text,
+    drafts = _build_parents(paper, cfg)
+    for parent_idx, draft in enumerate(drafts, start=1):
+        parent_key = f"parent_{parent_idx:04d}"
+        page_start, page_end = _pages_of(draft.elements)
+        element_ids = list(dict.fromkeys(el.element_id for el in draft.elements))
+        section_path = draft.sections[0] if draft.sections else []
+        parents.append(
+            ChunkDraft(
+                content=draft.text,
+                chunk_type=PARENT_CHUNK_TYPE,
+                section_path=section_path,
+                page_start=page_start,
+                page_end=page_end,
+                token_count=estimate_tokens(draft.text),
+                element_ids=element_ids,
                 metadata={
                     "paper_id": paper.paper_id,
-                    "section_path": list(path),
-                    "page_start": page_start,
-                    "page_end": page_end,
-                    "element_ids": [el.element_id for el in elems],
+                    "parent_key": parent_key,
+                    "sections": [" > ".join(s) for s in draft.sections],
+                    "bpe_tokens": draft.tokens,
+                    "splitter": _SPLITTER,
                 },
             )
         )
-
-    parent_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=cfg.parent_max_tokens,
-        chunk_overlap=0,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    child_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=cfg.child_max_tokens,
-        chunk_overlap=cfg.overlap_tokens,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-
-    parent_documents = parent_splitter.split_documents(source_documents)
-    for parent_idx, parent_doc in enumerate(parent_documents, start=1):
-        parent_key = f"parent_{parent_idx:04d}"
-        metadata = dict(parent_doc.metadata)
-        parent = ChunkDraft(
-            content=parent_doc.page_content,
-            chunk_type="parent_passage",
-            section_path=list(metadata.get("section_path") or []),
-            page_start=metadata.get("page_start"),
-            page_end=metadata.get("page_end"),
-            token_count=estimate_tokens(parent_doc.page_content),
-            element_ids=list(metadata.get("element_ids") or []),
-            metadata={
-                **metadata,
-                "parent_key": parent_key,
-                "splitter": "langchain_recursive_tiktoken",
-            },
-        )
-        parents.append(parent)
-
-        child_documents = child_splitter.split_documents(
-            [
-                Document(
-                    page_content=parent_doc.page_content,
-                    metadata={**metadata, "parent_key": parent_key},
-                )
-            ]
-        )
-        for child_doc in child_documents:
-            child_meta = dict(child_doc.metadata)
+        for piece in _split_children(draft.text, cfg):
+            child_start, child_end = _child_pages(piece, draft.elements)
             children.append(
                 ChunkDraft(
-                    content=child_doc.page_content,
+                    content=piece,
                     chunk_type="text",
-                    section_path=list(child_meta.get("section_path") or []),
-                    page_start=child_meta.get("page_start"),
-                    page_end=child_meta.get("page_end"),
-                    token_count=estimate_tokens(child_doc.page_content),
+                    section_path=section_path,
+                    page_start=child_start,
+                    page_end=child_end,
+                    token_count=estimate_tokens(piece),
                     parent_key=parent_key,
-                    element_ids=list(child_meta.get("element_ids") or []),
+                    element_ids=element_ids,
                     metadata={
-                        **child_meta,
-                        "splitter": "langchain_recursive_tiktoken",
+                        "paper_id": paper.paper_id,
+                        "parent_key": parent_key,
+                        "splitter": _SPLITTER,
                     },
                 )
             )
 
     def add_visual(visual: VisualElement, chunk_type: str) -> None:
-        parts = [
-            visual.caption or "",
-            visual.docling_text or "",
-            " ".join(visual.surrounding_text or []),
-        ]
-        # Figure-internal OCR marked separately, not mixed unmarked into body
+        # Figure-internal OCR is kept in metadata, not mixed unmarked into the body.
         internal = list(visual.internal_text or [])
-        content = "\n".join(p for p in parts if p).strip()
-        if not content and not internal:
-            content = f"{chunk_type} on page {visual.page}"
+        content = visual_chunk_content(visual, cfg) or f"{chunk_type} on page {visual.page}"
         meta: dict[str, Any] = {
+            "paper_id": paper.paper_id,
             "element_id": visual.element_id,
             "image_uri": visual.image_uri,
             "structured_data_uri": visual.structured_data_uri,
             "needs_enrichment": visual.needs_enrichment,
             "source_ref": visual.source_ref,
+            "model_generated_text": bool(luna_summary(visual)),
         }
         if internal:
             meta["figure_internal_text"] = internal
@@ -215,25 +320,28 @@ def chunk_paper_document(
     for formula in paper.formulas:
         add_visual(formula, "equation")
 
-    all_chunks = parents + children
-    lengths = [c.token_count for c in all_chunks] or [0]
-    orphaned = [
-        el.element_id
-        for el in paper.text_elements
-        if not any(el.element_id in p.element_ids for p in parents)
-    ]
+    covered = {eid for p in parents for eid in p.element_ids}
+    orphaned = [el.element_id for el in paper.text_elements if el.text and el.element_id not in covered]
+    parent_sizes = [d.tokens for d in drafts] or [0]
+    child_sizes = [_bpe_tokens(c.content) for c in children if c.chunk_type == "text"] or [0]
     metrics = {
         "parent_count": len(parents),
         "child_count": len(children),
-        "total_chunks": len(all_chunks),
-        "avg_tokens": round(sum(lengths) / max(len(lengths), 1), 2),
-        "min_tokens": min(lengths),
-        "max_tokens": max(lengths),
+        "indexed_chunks": len(children),
+        "total_chunks": len(parents) + len(children),
+        "parent_tokens": {"min": min(parent_sizes), "max": max(parent_sizes),
+                          "avg": round(sum(parent_sizes) / len(parent_sizes), 1)},
+        "child_tokens": {"min": min(child_sizes), "max": max(child_sizes),
+                         "avg": round(sum(child_sizes) / len(child_sizes), 1)},
         "orphaned_text_elements": len(orphaned),
         "orphaned_ids_sample": orphaned[:10],
-        "visual_chunks": sum(1 for c in children if c.chunk_type in {"table", "figure", "equation"}),
-        "section_groups": len(section_groups),
-        "splitter": "langchain_recursive_tiktoken",
+        "visual_chunks": sum(1 for c in children if c.chunk_type in VISUAL_CHUNK_TYPES),
+        "visual_chunks_with_model_text": sum(
+            1 for c in children if c.metadata.get("model_generated_text")
+        ),
+        "section_groups": len(_group_text_by_section(paper.text_elements)),
+        "splitter": _SPLITTER,
+        "strategy": "small_to_big",
     }
     return ChunkingResult(parent_chunks=parents, child_chunks=children, metrics=metrics)
 

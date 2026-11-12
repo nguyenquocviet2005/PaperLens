@@ -39,7 +39,9 @@ def _model(settings: Settings) -> ChatOpenAI:
         kwargs["base_url"] = base_url
     if "luna" in model.lower():
         kwargs["reasoning_effort"] = "none"
-    return ChatOpenAI(**kwargs)
+    from app.infrastructure.observability import llm_callbacks
+
+    return ChatOpenAI(**kwargs, callbacks=llm_callbacks())
 
 
 def enrich_cleaned_text(

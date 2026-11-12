@@ -8,7 +8,7 @@ import os
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from app.config import Settings, get_settings
 

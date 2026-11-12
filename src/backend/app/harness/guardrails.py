@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import Settings
+from app.infrastructure.observability import count
 
 # Dangerous active HTML / script patterns to neutralize in model output.
 _DANGEROUS_HTML_RE = re.compile(
@@ -49,6 +50,25 @@ _EXFIL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         ),
         "Message requests system prompt disclosure.",
     ),
+    # Vietnamese equivalents of the patterns above.
+    (
+        re.compile(
+            r"(?is)(?:bỏ\s*qua|phớt\s*lờ|lờ\s*đi|không\s*cần\s*tuân\s*theo)"
+            r".{0,40}(?:hướng\s*dẫn|chỉ\s*dẫn|chỉ\s*thị|quy\s*tắc|prompt)"
+            r".{0,40}(?:trước|trên|hệ\s*thống|ban\s*đầu|system)"
+        ),
+        "Message attempts to override system instructions.",
+    ),
+    (
+        re.compile(
+            r"(?is)(?:tiết\s*lộ|hiển\s*thị|in\s*ra|cho\s*(?:tôi|mình|tao)\s*xem|"
+            r"lặp\s*lại|xuất\s*ra|nhắc\s*lại)"
+            r".{0,40}(?:system\s*prompt|prompt\s*hệ\s*thống|lời\s*nhắc\s*hệ\s*thống|"
+            r"chỉ\s*dẫn\s*hệ\s*thống|hướng\s*dẫn\s*hệ\s*thống|api[_\s-]?key|khóa\s*api|"
+            r"khoá\s*api|mật\s*khẩu)"
+        ),
+        "Message requests system or secret material.",
+    ),
     (
         re.compile(
             r"(?is)\b(?:LLM_API_KEY|LUNA_API_KEY|EMBEDDING_API_KEY|DATABASE_URL|"
@@ -60,10 +80,7 @@ _EXFIL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
-_DATA_URL_RE = re.compile(
-    r"^data:(image/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=\s]+)$",
-    re.IGNORECASE,
-)
+_DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.*)$", re.IGNORECASE | re.DOTALL)
 
 ALLOWED_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"})
 
@@ -75,6 +92,7 @@ class GuardrailError(ValueError):
         super().__init__(message)
         self.code = code
         self.safe_message = message
+        count("GuardrailBlocks", dimensions={"Code": code})
 
 
 @dataclass(frozen=True)
@@ -174,12 +192,12 @@ def validate_image_data_url(data_url: str, *, settings: Settings) -> ValidatedIm
             "Unsupported image data URL. Allowed MIME types: png, jpeg, webp, gif.",
             code="invalid_image_mime",
         )
-    mime = match.group(1).lower()
+    mime = match.group(1).strip().lower()
     if mime == "image/jpg":
         mime = "image/jpeg"
     if mime not in ALLOWED_IMAGE_MIMES:
         raise GuardrailError(
-            f"Image MIME type '{mime}' is not allowed.",
+            "Unsupported image data URL. Allowed MIME types: png, jpeg, webp, gif.",
             code="invalid_image_mime",
         )
     b64 = re.sub(r"\s+", "", match.group(2))
@@ -266,5 +284,33 @@ def apply_output_guardrails(
 
 
 def guardrail_token(text: str, *, settings: Settings) -> str:
-    """Apply lightweight output controls to streaming tokens."""
+    """Apply lightweight output controls to one piece of text (no cross-token state)."""
     return sanitize_active_html(redact_secrets(text, settings))
+
+
+class StreamGuard:
+    """Redacts secrets across streamed tokens.
+
+    Filtering each token on its own misses a secret split over two tokens: the user has
+    already seen both halves by the time the final answer is redacted. The guard holds back
+    the last len(longest secret) - 1 characters until more text (or the end) arrives, so a
+    secret is always whole inside the buffer when it is checked.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.hold = max((len(s) for s in _secret_values(settings)), default=1) - 1
+        self.buffer = ""
+
+    def feed(self, text: str) -> str:
+        self.buffer = redact_secrets(self.buffer + (text or ""), self.settings)
+        if self.hold <= 0:
+            out, self.buffer = self.buffer, ""
+        else:
+            cut = max(0, len(self.buffer) - self.hold)
+            out, self.buffer = self.buffer[:cut], self.buffer[cut:]
+        return sanitize_active_html(out) if out else ""
+
+    def flush(self) -> str:
+        out, self.buffer = redact_secrets(self.buffer, self.settings), ""
+        return sanitize_active_html(out) if out else ""

@@ -27,10 +27,11 @@ resource "aws_iam_role_policy_attachment" "api_execution" {
 data "aws_iam_policy_document" "api_execution_secrets" {
   statement {
     actions = ["secretsmanager:GetSecretValue"]
-    resources = [
+    resources = concat([
       aws_secretsmanager_secret.llm_api_key.arn,
       aws_secretsmanager_secret.database_url.arn,
-    ]
+      aws_secretsmanager_secret.langsmith_api_key.arn,
+    ], var.aux_llm_model == "" ? [] : [aws_secretsmanager_secret.openai_api_key.arn])
   }
 }
 

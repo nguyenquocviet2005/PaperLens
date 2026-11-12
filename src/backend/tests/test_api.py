@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings, get_settings
 from app.main import app
-from app.infrastructure.storage import LocalStorage, get_storage
+from app.infrastructure.storage import LocalStorage
 
 
 @pytest.fixture()

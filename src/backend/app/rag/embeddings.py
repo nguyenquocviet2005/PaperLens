@@ -18,6 +18,7 @@ from app.db.url_utils import classify_database_url, ensure_sslmode
 logger = logging.getLogger(__name__)
 
 VECTOR_COLLECTION = "paperlens_chunks"
+PARENT_CHUNK_TYPE = "parent_passage"  # mirrors app.ingestion.chunking (avoids an import cycle)
 
 
 class EmbeddingError(Exception):
@@ -132,6 +133,8 @@ def index_paper_chunks(
                 .order_by(PaperChunk.chunk_type, PaperChunk.id)
             )
         )
+        # Small-to-big: parents are what the LLM reads, never what is searched.
+        rows = [row for row in rows if row.chunk_type != PARENT_CHUNK_TYPE]
         pending = [
             row
             for row in rows

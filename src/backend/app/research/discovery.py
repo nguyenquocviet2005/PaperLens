@@ -8,7 +8,7 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 from typing import Any, Literal
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import urlencode
 
 import httpx
 from pydantic import BaseModel, Field

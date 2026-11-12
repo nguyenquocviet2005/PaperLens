@@ -153,6 +153,17 @@ def _apply_v02_columns(engine: Engine) -> None:
                 connection.execute(
                     text("ALTER TABLE agent_conversations ADD COLUMN title VARCHAR(512)")
                 )
+            # v0.3: context memory (see migrations/004_conversation_memory.sql).
+            for name, ddl in (
+                ("kind", "VARCHAR(32) NOT NULL DEFAULT 'agent'"),
+                ("context_summary", "TEXT"),
+                ("summarized_turns", "INTEGER NOT NULL DEFAULT 0"),
+                ("context_state", "JSON"),
+            ):
+                if name not in columns:
+                    connection.execute(
+                        text(f"ALTER TABLE agent_conversations ADD COLUMN {name} {ddl}")
+                    )
             connection.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_agent_conversations_user_id "

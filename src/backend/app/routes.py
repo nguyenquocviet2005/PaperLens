@@ -17,6 +17,7 @@ from app.db.repository import PaperRepository
 from app.db.session import session_scope
 from app.guest import consume_guest_quota, create_guest_session, guest_trial_available
 from app.ingestion.luna import LunaClient, LunaDisabledError
+from app.ingestion.chunking import chunk_paper_document, persist_chunks
 from app.ingestion.pipeline import IngestionError, ingest_pdf_bytes
 from app.schemas import (
     AgentConversationResponse,
@@ -607,6 +608,8 @@ def paper_qa(
         settings=settings,
         top_k=body.top_k,
         conversation_id=body.conversation_id,
+        persist=True,
+        user_id=user.user_id,
     )
     return {
         "paper_id": paper_id,
@@ -990,6 +993,7 @@ def enrich_paper(
                 )
             )
 
+    message = None
     if paper is not None:
         storage.save_json(paper_key, paper.model_dump(mode="json"))
         storage.save_json(
@@ -1000,8 +1004,18 @@ def enrich_paper(
                 "formulas": [f.model_dump(mode="json") for f in paper.formulas],
             },
         )
+        if any(item.status == "completed" for item in results):
+            # New descriptions only help retrieval once they are in the chunks.
+            try:
+                persist_chunks(paper_id, chunk_paper_document(paper), settings=settings)
+                index_paper_chunks(paper_id, settings=settings, force=True)
+                message = "Enrichment added to the search index."
+            except Exception as exc:
+                logger.warning("Re-indexing after enrichment failed for %s: %s", paper_id, exc)
+                message = "Enrichment saved, but re-indexing failed; search uses the old chunks."
 
     return EnrichResponse(
+        message=message,
         paper_id=paper_id,
         luna_enabled=settings.luna_enabled,
         allow_external_api=settings.allow_external_api,

@@ -195,8 +195,8 @@ resource "aws_ecs_task_definition" "api" {
 
     portMappings = [{ containerPort = 8080, protocol = "tcp" }]
 
-    environment = [for name, value in local.api_environment : { name = name, value = value }]
-    secrets     = [for name, arn in local.api_secrets : { name = name, valueFrom = arn }]
+    environment = [for name, value in merge(local.api_environment, local.aux_llm_environment) : { name = name, value = value }]
+    secrets     = [for name, arn in merge(local.api_secrets, local.aux_llm_secrets) : { name = name, valueFrom = arn }]
 
     linuxParameters = { initProcessEnabled = true }
     ulimits         = [{ name = "nofile", softLimit = 65536, hardLimit = 65536 }]

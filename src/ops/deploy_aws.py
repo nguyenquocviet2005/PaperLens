@@ -6,7 +6,12 @@ Run from the repository root:
   python src/ops/deploy_aws.py both
 
 Infrastructure itself is owned by Terraform in infra/prod; this script only
-publishes new versions. No secret values are printed. The UI's runtime config
+publishes new versions, and refuses a release plan that would change anything
+other than the API task definition and service (apply such changes on purpose
+with a reviewed `terraform apply`). No secret values are printed.
+
+The same script runs in GitHub Actions (.github/workflows/deploy.yml) with
+--yes; there, Vercel reads VERCEL_TOKEN / VERCEL_ORG_ID / VERCEL_PROJECT_ID. The UI's runtime config
 (API URL, Supabase URL and publishable key) lives in the Vercel project's
 environment variables and is rendered by src/frontend/vercel-build.sh.
 """
@@ -15,10 +20,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -109,14 +116,42 @@ def build_image(outputs: dict[str, str], tag: str) -> None:
     print(f"Image pushed: {outputs['ecr_repository_url']}:{tag}")
 
 
-def roll_service(assume_yes: bool) -> None:
-    """Plan only the ECS service (the image tag lives in SSM), confirm, then apply that plan."""
+# What a release may change. Everything else is an infrastructure change.
+RELEASE_CHANGES = {
+    "aws_ecs_task_definition.api": {"create", "delete", "update", "no-op", "read"},
+    "aws_ecs_service.api": {"update", "no-op", "read"},
+}
+
+
+def unexpected_changes(plan: dict) -> list[str]:
+    """Resource changes in a `terraform show -json` plan that a release must not make."""
+    problems = []
+    for change in plan.get("resource_changes") or []:
+        actions = set(change["change"]["actions"])
+        if actions <= {"no-op", "read"}:
+            continue
+        allowed = RELEASE_CHANGES.get(change["address"])
+        if allowed is None or not actions <= allowed:
+            problems.append(f"{change['address']}: {'/'.join(sorted(actions))}")
+    return problems
+
+
+def roll_service(assume_yes: bool, allow_infra_changes: bool = False) -> None:
+    """Plan only the ECS service (the image tag lives in SSM), check, confirm, apply that plan."""
     plan_file = "release.tfplan"
     run([
-        "terraform", f"-chdir={TF_DIR}", "plan", "-input=false",
+        "terraform", f"-chdir={TF_DIR}", "plan", "-input=false", "-lock-timeout=5m",
         "-target=aws_ecs_service.api", f"-out={plan_file}",
     ])
     try:
+        plan = json.loads(capture(["terraform", f"-chdir={TF_DIR}", "show", "-json", plan_file]))
+        problems = unexpected_changes(plan)
+        if problems and not allow_infra_changes:
+            raise SystemExit(
+                "Release plan would change infrastructure beyond the API service:\n  "
+                + "\n  ".join(problems)
+                + "\nApply those changes with a reviewed `terraform apply` first."
+            )
         if not assume_yes and input("Apply this plan? [y/N] ").strip().lower() != "y":
             raise SystemExit("Aborted; nothing applied")
         run(["terraform", f"-chdir={TF_DIR}", "apply", "-input=false", plan_file])
@@ -124,7 +159,34 @@ def roll_service(assume_yes: bool) -> None:
         (TF_DIR / plan_file).unlink(missing_ok=True)
 
 
-def deploy_api(tag: str | None, assume_yes: bool) -> None:
+def set_image_tag(tag: str) -> None:
+    run([
+        "aws", "ssm", "put-parameter", f"--region={REGION}",
+        f"--name={IMAGE_TAG_PARAM}", f"--value={tag}", "--overwrite",
+    ], stdout=subprocess.DEVNULL)
+
+
+def smoke_test(api_url: str, timeout_seconds: int = 300) -> None:
+    """The service is "stable" once the ALB health check passes; check from outside too."""
+    deadline = time.time() + timeout_seconds
+    url = f"{api_url.rstrip('/')}/health"
+    while True:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                body = json.loads(response.read() or b"{}")
+            if response.status == 200 and body.get("status") in {"ok", "healthy", None}:
+                print(f"Smoke test passed: {url}")
+                return
+        except Exception as exc:  # retried until the deadline
+            error = type(exc).__name__
+        else:
+            error = f"HTTP {response.status}"
+        if time.time() > deadline:
+            raise SystemExit(f"Smoke test failed: {url} ({error})")
+        time.sleep(10)
+
+
+def deploy_api(tag: str | None, assume_yes: bool, allow_infra_changes: bool = False) -> None:
     outputs = tf_outputs()
     repository = outputs["ecr_repository_url"].split("/", 1)[1]
     tag = tag or image_tag(outputs["compute_mode"])
@@ -134,25 +196,39 @@ def deploy_api(tag: str | None, assume_yes: bool) -> None:
     else:
         build_image(outputs, tag)
 
-    run([
-        "aws", "ssm", "put-parameter", f"--region={REGION}",
-        f"--name={IMAGE_TAG_PARAM}", f"--value={tag}", "--overwrite",
-    ], stdout=subprocess.DEVNULL)
-    roll_service(assume_yes)
+    previous = capture([
+        "aws", "ssm", "get-parameter", f"--region={REGION}", f"--name={IMAGE_TAG_PARAM}",
+        "--query=Parameter.Value", "--output=text",
+    ])
+    set_image_tag(tag)
+    try:
+        roll_service(assume_yes, allow_infra_changes)
+    except BaseException:
+        # Nothing was applied: point the parameter back at the image that is running,
+        # so the next `terraform apply` does not roll out an unreleased image.
+        set_image_tag(previous)
+        raise
     print("Waiting for the ECS service to become stable (first start can take ~10 min)...")
     run([
         "aws", "ecs", "wait", "services-stable", f"--region={REGION}",
         f"--cluster={outputs['ecs_cluster']}", f"--services={outputs['ecs_service']}",
     ])
+    smoke_test(outputs["api_url"])
     print(f"API deployed: {outputs['api_url']} ({tag})")
 
 
 def deploy_ui() -> None:
-    if not (FRONTEND_DIR / ".vercel" / "project.json").exists():
+    in_ci = bool(os.environ.get("VERCEL_ORG_ID") and os.environ.get("VERCEL_PROJECT_ID"))
+    if not in_ci and not (FRONTEND_DIR / ".vercel" / "project.json").exists():
         raise SystemExit(
             "src/frontend is not linked to Vercel; run `vercel link --project paperlens` there first"
         )
-    run(["vercel", "deploy", "--prod", "--yes"], cwd=FRONTEND_DIR, stdout=subprocess.DEVNULL)
+    cmd = ["vercel", "deploy", "--prod", "--yes"]
+    print(">", " ".join(cmd), flush=True)  # printed before the token is appended
+    token = os.environ.get("VERCEL_TOKEN")
+    if token:
+        cmd += ["--token", token]
+    subprocess.run(cmd, cwd=FRONTEND_DIR, check=True, stdout=subprocess.DEVNULL)
     print("UI deployed: https://paperlens.ailearn-vaic.cloud")
 
 
@@ -162,6 +238,11 @@ def main() -> int:
     parser.add_argument("--tag", help="Deploy an existing ECR image tag instead of building")
     parser.add_argument("--build-only", action="store_true", help="Build and push the API image only")
     parser.add_argument("--yes", action="store_true", help="Apply the release plan without prompting")
+    parser.add_argument(
+        "--allow-infra-changes",
+        action="store_true",
+        help="Apply a release plan that also changes other resources (local use only)",
+    )
     args = parser.parse_args()
     if args.build_only:
         outputs = tf_outputs()
@@ -170,7 +251,7 @@ def main() -> int:
         print(f"TAG={tag}")
         return 0
     if args.target in {"api", "both"}:
-        deploy_api(args.tag, args.yes)
+        deploy_api(args.tag, args.yes, args.allow_infra_changes)
     if args.target in {"ui", "both"}:
         deploy_ui()
     return 0

@@ -30,6 +30,8 @@ dependencies = [
   "langchain-postgres",
   "langchain-text-splitters",
   "langchain-community",
+  "langchain-classic",
+  "tiktoken>=0.7",
   "rank-bm25",
   "sympy>=1.12",
 ]

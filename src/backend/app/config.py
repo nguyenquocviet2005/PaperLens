@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     text_enrichment_max_chars_per_section: int = 6000
     text_enrichment_max_total_chars: int = 30000
     ingest_auto_text_enrich: bool = False
+    # Run Luna on tables/figures/formulas during upload so its descriptions reach the
+    # index. Off by default: each element costs one VLM request (free tiers run out fast).
+    ingest_auto_visual_enrich: bool = False
+    luna_max_concurrency: int = 4
+    # Context paragraphs attached to table/figure/formula chunks (token budget, gpt2 BPE).
+    surrounding_text_max_tokens: int = 200
+    # Rank nearby paragraphs by embedding similarity to the caption (falls back to distance).
+    surrounding_text_use_embeddings: bool = True
     allow_external_api: bool = False
 
     max_pdf_size_mb: int = 50
@@ -115,6 +123,9 @@ class Settings(BaseSettings):
     embedding_batch_size: int | None = None
     retrieval_top_k: int = 8
     retrieval_use_mmr: bool = False
+    # Small-to-big: search child chunks, hand the LLM their parent passages.
+    retrieval_expand_parents: bool = True
+    retrieval_max_evidence_tokens: int = 4000
 
     llm_enabled: bool = False
     llm_provider: str = "openai"
@@ -137,15 +148,35 @@ class Settings(BaseSettings):
         "https://paperlens.ailearn-vaic.cloud"
     )
     cors_allow_origin_regex: str = ""
-    langsmith_enabled: bool = False
+    # LangSmith tracing is read by LangChain itself from LANGSMITH_TRACING,
+    # LANGSMITH_API_KEY and LANGSMITH_PROJECT; this mirror is for /health only.
     langsmith_tracing: bool = False
+    # "json" in production: one JSON object per line, with the request id.
+    log_format: Literal["text", "json"] = "text"
+    # CloudWatch Embedded Metric Format lines on stdout (namespace "PaperLens").
+    metrics_enabled: bool = False
     allow_paid_evaluation: bool = False
 
     # Unified agent request/response safety limits (deterministic guardrails).
     agent_max_message_chars: int = 8000
     agent_max_selected_papers: int = 8
     agent_max_image_bytes: int = 2 * 1024 * 1024
-    agent_history_limit: int = 24
+    # Messages kept in the database per conversation (storage cap, not prompt size).
+    agent_history_limit: int = 400
+    # Context engineering (app/harness/memory.py): recent whole turns up to this many
+    # tokens and turns; older turns are folded into a rolling summary.
+    agent_context_recent_tokens: int = 3000
+    agent_context_max_turns: int = 6
+    agent_summary_use_llm: bool = True
+    agent_summary_max_words: int = 150
+    # Summarize once this many dropped turns are waiting (one-line briefs cover them
+    # meanwhile), so long chats cost one summary call per few turns, not per turn.
+    agent_summary_batch_turns: int = 3
+    # Optional cheaper model for summaries and query rewriting (OpenAI API); empty = LLM_MODEL.
+    agent_summary_model: str = ""
+    agent_summary_api_key: str | None = None
+    # Rewrite follow-up / non-English questions into a standalone English retrieval query.
+    qa_query_rewrite: bool = True
     agent_reasoning_enabled: bool = True
     agent_reasoning_effort: Literal["low", "medium", "high"] = "medium"
 

@@ -76,3 +76,39 @@ variable "vercel_ipv4" {
   type        = list(string)
   default     = ["216.198.79.1", "64.29.17.1"]
 }
+
+variable "langsmith_enabled" {
+  description = "Send agent/LLM traces to LangSmith (needs a value in the langsmith-api-key secret first)"
+  type        = bool
+  default     = false
+}
+
+variable "langsmith_project" {
+  description = "LangSmith project that receives production traces"
+  type        = string
+  default     = "paperlens-prod"
+}
+
+variable "github_repository" {
+  description = "owner/name of the GitHub repository allowed to deploy through OIDC"
+  type        = string
+  default     = "nguyenquocviet2005/PaperLens"
+}
+
+variable "github_deploy_branch" {
+  description = "Only workflows running on this branch may assume the deploy role"
+  type        = string
+  default     = "master"
+}
+
+variable "extra_cors_origins" {
+  description = "Other exact browser origins allowed to call the API (e.g. the Vercel project URL)"
+  type        = list(string)
+  default     = []
+}
+
+variable "aux_llm_model" {
+  description = "Cheap OpenAI model for history summaries and query rewriting (e.g. gpt-5.4-nano), keyed by the openai-api-key secret. Empty = use llm_model."
+  type        = string
+  default     = ""
+}

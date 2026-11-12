@@ -50,3 +50,16 @@ output "build_source_bucket" {
 output "compute_mode" {
   value = var.compute_mode
 }
+
+output "github_deploy_role_arn" {
+  description = "Set as the AWS_DEPLOY_ROLE_ARN repository variable in GitHub"
+  value       = aws_iam_role.github_deploy.arn
+}
+
+output "dashboard_url" {
+  value = "https://${var.region}.console.aws.amazon.com/cloudwatch/home?region=${var.region}#dashboards/dashboard/${aws_cloudwatch_dashboard.main.dashboard_name}"
+}
+
+output "langsmith_secret_id" {
+  value = aws_secretsmanager_secret.langsmith_api_key.id
+}
