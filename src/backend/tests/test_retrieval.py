@@ -126,3 +126,67 @@ def test_langchain_hybrid_eval(retrieval_env: Settings):
     report = evaluate_retrieval(cases, settings=retrieval_env, k_values=(5, 10))
     assert report["metrics"]["n_cases"] == 2
     assert report["metrics"]["Recall@5"] >= 0.5
+
+
+class _QueryTimeFailingEmbeddings:
+    """Embeds documents fine but fails on queries, like a provider that starts rate-limiting."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def embed_documents(self, texts):
+        return self.inner.embed_documents(texts)
+
+    def embed_query(self, text):
+        raise RuntimeError("429 Too Many Requests")
+
+
+def test_retrieve_falls_back_to_bm25_when_query_embedding_fails(retrieval_env, monkeypatch):
+    import app.rag.retrieval as retrieval_module
+
+    real_get_embeddings = retrieval_module.get_embeddings
+
+    def failing_get_embeddings(settings=None):
+        embeddings, name = real_get_embeddings(settings)
+        return _QueryTimeFailingEmbeddings(embeddings), name
+
+    monkeypatch.setattr(retrieval_module, "get_embeddings", failing_get_embeddings)
+    out = retrieve(
+        "temperature scaling expected calibration error",
+        paper_id="rp1",
+        settings=retrieval_env,
+        top_k=5,
+    )
+    assert out["results"]
+    assert "calibration" in out["results"][0]["content"].lower()
+
+
+def test_openai_compatible_embeddings_send_raw_strings():
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        embedding_provider="openai",
+        embedding_model="nvidia/nemotron-3.5-embed-1b:free",
+        embedding_api_key="test-key",
+        embedding_base_url="https://openrouter.ai/api/v1",
+        embedding_dimensions=384,
+    )
+    embeddings, model_name = get_embeddings(settings)
+    assert model_name == "nvidia/nemotron-3.5-embed-1b:free"
+    assert embeddings.check_embedding_ctx_length is False
+    assert embeddings.dimensions == 384
+
+
+def test_self_hosted_embeddings_omit_dimensions_and_cap_batches():
+    settings = Settings(
+        database_url="sqlite:///:memory:",
+        embedding_provider="openai",
+        embedding_model="BAAI/bge-small-en-v1.5",
+        embedding_api_key="local-tei",
+        embedding_base_url="http://127.0.0.1:8081/v1",
+        embedding_send_dimensions=False,
+        embedding_batch_size=32,
+    )
+    embeddings, _ = get_embeddings(settings)
+    assert embeddings.dimensions is None
+    assert embeddings.chunk_size == 32
+    assert embeddings.check_embedding_ctx_length is False

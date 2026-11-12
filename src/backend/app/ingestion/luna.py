@@ -20,6 +20,7 @@ from app.schemas import (
     VisualEnrichment,
     utc_now,
 )
+from app.infrastructure.observability import record_vlm_call
 from app.infrastructure.storage import StorageBackend, paper_enrichment_key
 
 logger = logging.getLogger(__name__)
@@ -185,8 +186,14 @@ class LunaClient:
         usage: dict[str, Any] | None = None
 
         for attempt in range(self.settings.luna_max_retries + 1):
+            started = time.perf_counter()
+            usage = None
             try:
                 raw, usage = self._call_provider(prompt=prompt, image_bytes=image_bytes)
+                record_vlm_call(
+                    model=self.settings.luna_model, seconds=time.perf_counter() - started,
+                    usage=usage, ok=True,
+                )
                 parsed = schema.model_validate(_normalize_schema_payload(kind, raw))
                 enrichment = VisualEnrichment(
                     provider=self.settings.luna_provider,
@@ -215,6 +222,11 @@ class LunaClient:
                 return enrichment
             except (ValidationError, LunaError, json.JSONDecodeError, Exception) as exc:
                 last_error = exc
+                if not usage:
+                    record_vlm_call(
+                        model=self.settings.luna_model, seconds=time.perf_counter() - started,
+                        usage=None, ok=False,
+                    )
                 logger.warning(
                     "Luna attempt %s failed for %s: %s",
                     attempt + 1,
@@ -239,7 +251,9 @@ class LunaClient:
     def _call_provider(self, *, prompt: str, image_bytes: bytes) -> tuple[dict[str, Any], dict[str, Any] | None]:
         from openai import OpenAI
 
-        client_kwargs: dict[str, Any] = {"api_key": self.settings.luna_api_key}
+        # Retries are handled by enrich_element; the SDK's own 2 silent retries would
+        # triple the requests spent on a failing element.
+        client_kwargs: dict[str, Any] = {"api_key": self.settings.luna_api_key, "max_retries": 0}
         if self.settings.luna_base_url:
             client_kwargs["base_url"] = self.settings.luna_base_url
         client = OpenAI(**client_kwargs)

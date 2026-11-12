@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -20,16 +21,26 @@ from langchain_openai import ChatOpenAI
 
 from app.config import Settings, get_settings
 from app.harness.context import (
+    StoredConversation,
     build_human_message,
     content_text,
     get_agent_conversation,
-    load_history,
+    load_conversation,
     save_history,
+    save_memory,
 )
+from app.harness.memory import (
+    ContextPlan,
+    build_context,
+    split_turns,
+    summarize_turns,
+    update_state,
+)
+from app.infrastructure.observability import emit_metrics, llm_callbacks, trace_config
 from app.harness.guardrails import (
     ValidatedImage,
     apply_output_guardrails,
-    guardrail_token,
+    StreamGuard,
 )
 from app.infrastructure.storage import get_storage, paper_normalized_key
 from app.rag.qa import answer_paper_question
@@ -77,7 +88,7 @@ def _model(settings: Settings) -> ChatOpenAI:
     elif "luna" in model_name:
         # Luna Chat Completions rejects function tools with reasoning enabled.
         kwargs["reasoning_effort"] = "none"
-    return ChatOpenAI(**kwargs)
+    return ChatOpenAI(**kwargs, callbacks=llm_callbacks())
 
 
 def _resolve_paper_id(requested: str, selected: list[str]) -> str:
@@ -213,9 +224,12 @@ def build_tools(
 
 
 def _create_graph(
-    settings: Settings, selected: list[str], *, user_id: str = "local-user"
+    settings: Settings, selected: list[str], *, user_id: str = "local-user", memory: str = ""
 ):
     selected_context = ", ".join(selected) if selected else "none"
+    # Fixed instructions first, per-conversation memory last: a stable prompt prefix
+    # is what provider prompt caching reuses.
+    memory_block = f"\n\n{memory}" if memory else ""
     model = _model(settings)
     return create_agent(
         model,
@@ -237,6 +251,7 @@ def _create_graph(
             "never reveal private chain-of-thought; provide concise conclusions and an "
             "inspectable tool/evidence trace instead. "
             f"Currently selected paper IDs: {selected_context}."
+            f"{memory_block}"
         ),
         name="paperlens_research_agent",
     )
@@ -300,6 +315,137 @@ def _collect_result(
     }
 
 
+@dataclass
+class _Turn:
+    conversation_id: str
+    selected: list[str]
+    stored: StoredConversation
+    plan: ContextPlan
+    inputs: list[BaseMessage]
+
+
+def _start_turn(
+    message: str,
+    *,
+    cid: str,
+    selected: list[str],
+    cfg: Settings,
+    image: ValidatedImage | None,
+    user_id: str,
+) -> _Turn:
+    stored = load_conversation(cid, cfg, user_id=user_id)
+    plan = build_context(
+        stored.messages,
+        summary=stored.summary,
+        summarized_turns=stored.summarized_turns,
+        state=stored.state,
+        settings=cfg,
+    )
+    emit_metrics(
+        {
+            "ContextMemoryTokens": (plan.tokens.get("memory", 0), "Count"),
+            "ContextHistoryTokens": (plan.tokens.get("recent", 0), "Count"),
+            "HistoryTurnsKept": (plan.recent_turns, "Count"),
+            "HistoryTurnsDropped": (plan.dropped_turns, "Count"),
+        }
+    )
+    human = build_human_message(message, image=image)
+    return _Turn(cid, selected, stored, plan, [*plan.messages, human])
+
+
+def _graph_for(turn: _Turn, cfg: Settings, user_id: str):
+    kwargs: dict[str, Any] = {}
+    if user_id != "local-user":
+        kwargs["user_id"] = user_id
+    if turn.plan.memory:
+        kwargs["memory"] = turn.plan.memory
+    return _create_graph(cfg, turn.selected, **kwargs)
+
+
+def _paper_titles(paper_ids: list[str], cfg: Settings, user_id: str) -> dict[str, str]:
+    if not paper_ids:
+        return {}
+    try:
+        from app.db.repository import PaperRepository
+        from app.db.session import session_scope
+
+        with session_scope(cfg) as session:
+            repo = PaperRepository(session)
+            titles = {}
+            for paper_id in paper_ids:
+                paper = repo.get_paper(paper_id)
+                if paper is not None and (paper.title or paper.filename):
+                    titles[paper_id] = str(paper.title or paper.filename)
+            return titles
+    except Exception:
+        logger.debug("Paper titles unavailable for conversation state", exc_info=True)
+        return {}
+
+
+def _finish_turn(
+    turn: _Turn,
+    final_messages: list[BaseMessage],
+    *,
+    cfg: Settings,
+    image: ValidatedImage | None,
+    user_id: str,
+) -> list[BaseMessage]:
+    """Append this turn (the human message onwards) to the stored history."""
+    new_messages = final_messages[len(turn.inputs) - 1 :]
+    save_history(
+        turn.conversation_id,
+        new_messages,
+        selected_papers=turn.selected,
+        settings=cfg,
+        human_image=image,
+        user_id=user_id,
+    )
+    return new_messages
+
+
+def _update_memory(
+    turn: _Turn, new_messages: list[BaseMessage], *, cfg: Settings, user_id: str
+) -> None:
+    """Refresh the structured state and fold turns that will no longer fit into the summary.
+
+    Runs after the answer is delivered, so a summary call never delays the user.
+    """
+    try:
+        new_turns = split_turns(new_messages)
+        state = update_state(
+            turn.stored.state,
+            new_turns[0] if new_turns else [],
+            selected_papers=turn.selected,
+            paper_titles=_paper_titles(turn.selected, cfg, user_id),
+        )
+        history = [*turn.stored.messages, *new_messages]
+        upcoming = build_context(
+            history,
+            summary=turn.stored.summary,
+            summarized_turns=turn.stored.summarized_turns,
+            state=state,
+            settings=cfg,
+        )
+        summary, summarized = None, None
+        if len(upcoming.unsummarized_dropped) >= max(1, cfg.agent_summary_batch_turns):
+            summary, method = summarize_turns(
+                turn.stored.summary, upcoming.unsummarized_dropped, settings=cfg
+            )
+            summarized = upcoming.dropped_turns
+            emit_metrics(
+                {
+                    "HistorySummaries": (1, "Count"),
+                    "HistoryTurnsSummarized": (len(upcoming.unsummarized_dropped), "Count"),
+                },
+                dimensions={"Method": method},
+            )
+        save_memory(
+            turn.conversation_id, cfg, state=state, summary=summary, summarized_turns=summarized
+        )
+    except Exception:
+        logger.exception("Conversation memory update failed for %s", turn.conversation_id)
+
+
 def run_agent(
     message: str,
     *,
@@ -312,30 +458,15 @@ def run_agent(
     cfg = settings or get_settings()
     selected = list(dict.fromkeys(selected_papers or []))
     cid = conversation_id or str(uuid4())
-    history = load_history(cid, cfg, user_id=user_id)
-    human = build_human_message(message, image=image)
-    graph = (
-        _create_graph(cfg, selected, user_id=user_id)
-        if user_id != "local-user"
-        else _create_graph(cfg, selected)
-    )
-    output = graph.invoke(
-        {"messages": [*history, human]}
+    turn = _start_turn(message, cid=cid, selected=selected, cfg=cfg, image=image, user_id=user_id)
+    output = _graph_for(turn, cfg, user_id).invoke(
+        {"messages": turn.inputs},
+        config=trace_config("paperlens-agent", conversation_id=cid, papers=len(selected)),
     )
     messages = list(output["messages"])
-    save_history(
-        cid,
-        messages,
-        selected_papers=selected,
-        settings=cfg,
-        human_image=image,
-        user_id=user_id,
-    )
-    result = _collect_result(
-        messages,
-        history_length=len(history),
-        conversation_id=cid,
-    )
+    new_messages = _finish_turn(turn, messages, cfg=cfg, image=image, user_id=user_id)
+    result = _collect_result(messages, history_length=len(turn.inputs) - 1, conversation_id=cid)
+    _update_memory(turn, new_messages, cfg=cfg, user_id=user_id)
     return apply_output_guardrails(result, settings=cfg)
 
 
@@ -352,21 +483,16 @@ def stream_agent(
     cfg = settings or get_settings()
     selected = list(dict.fromkeys(selected_papers or []))
     cid = conversation_id or str(uuid4())
-    history = load_history(cid, cfg, user_id=user_id)
-    human = build_human_message(message, image=image)
-    inputs = {"messages": [*history, human]}
+    turn = _start_turn(message, cid=cid, selected=selected, cfg=cfg, image=image, user_id=user_id)
     final_messages: list[BaseMessage] = []
-    observed_messages = len(inputs["messages"])
+    observed_messages = len(turn.inputs)
 
     yield {"type": "start", "conversation_id": cid}
-    graph = (
-        _create_graph(cfg, selected, user_id=user_id)
-        if user_id != "local-user"
-        else _create_graph(cfg, selected)
-    )
-    for mode, data in graph.stream(
-        inputs,
+    guard = StreamGuard(cfg)
+    for mode, data in _graph_for(turn, cfg, user_id).stream(
+        {"messages": turn.inputs},
         stream_mode=["messages", "values"],
+        config=trace_config("paperlens-agent-stream", conversation_id=cid, papers=len(selected)),
     ):
         if mode == "messages":
             chunk, metadata = data
@@ -375,12 +501,9 @@ def stream_agent(
                 # emit message chunks. Only root agent-model tokens belong in chat.
                 if str((metadata or {}).get("langgraph_node") or "") != "model":
                     continue
-                text = content_text(chunk.content)
-                if text:
-                    yield {
-                        "type": "token",
-                        "content": guardrail_token(text, settings=cfg),
-                    }
+                safe = guard.feed(content_text(chunk.content))
+                if safe:
+                    yield {"type": "token", "content": safe}
             continue
 
         final_messages = list(data.get("messages") or [])
@@ -400,18 +523,14 @@ def stream_agent(
                 }
         observed_messages = len(final_messages)
 
-    save_history(
-        cid,
-        final_messages,
-        selected_papers=selected,
-        settings=cfg,
-        human_image=image,
-        user_id=user_id,
-    )
+    tail = guard.flush()
+    if tail:
+        yield {"type": "token", "content": tail}
+    new_messages = _finish_turn(turn, final_messages, cfg=cfg, image=image, user_id=user_id)
     result = _collect_result(
-        final_messages,
-        history_length=len(history),
-        conversation_id=cid,
+        final_messages, history_length=len(turn.inputs) - 1, conversation_id=cid
     )
     result = apply_output_guardrails(result, settings=cfg)
     yield {"type": "done", **result}
+    # After "done": the client already has the answer when the summary call runs.
+    _update_memory(turn, new_messages, cfg=cfg, user_id=user_id)

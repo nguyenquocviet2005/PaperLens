@@ -26,11 +26,11 @@ class Settings(BaseSettings):
     app_host: str = "127.0.0.1"
     app_port: int = 8000
 
-    storage_backend: Literal["local", "gcs"] = "local"
+    storage_backend: Literal["local", "s3"] = "local"
     local_storage_root: Path = Path("runtime/outputs")
 
-    gcp_project_id: str = "paperlens-dev-26"
-    gcs_bucket_name: str = "paperlens-dev-26-paper-storage"
+    s3_bucket_name: str = ""
+    aws_region: str | None = None
 
     docling_ocr_mode: Literal["off", "on", "auto"] = "auto"
     docling_images_scale: float = 1.5
@@ -62,6 +62,14 @@ class Settings(BaseSettings):
     text_enrichment_max_chars_per_section: int = 6000
     text_enrichment_max_total_chars: int = 30000
     ingest_auto_text_enrich: bool = False
+    # Run Luna on tables/figures/formulas during upload so its descriptions reach the
+    # index. Off by default: each element costs one VLM request (free tiers run out fast).
+    ingest_auto_visual_enrich: bool = False
+    luna_max_concurrency: int = 4
+    # Context paragraphs attached to table/figure/formula chunks (token budget, gpt2 BPE).
+    surrounding_text_max_tokens: int = 200
+    # Rank nearby paragraphs by embedding similarity to the caption (falls back to distance).
+    surrounding_text_use_embeddings: bool = True
     allow_external_api: bool = False
 
     max_pdf_size_mb: int = 50
@@ -109,8 +117,15 @@ class Settings(BaseSettings):
     )
     embedding_base_url: str | None = None
     embedding_dimensions: int = 384
+    # Self-hosted servers (e.g. TEI) serve fixed-size models and may reject `dimensions`.
+    embedding_send_dimensions: bool = True
+    # Texts per embeddings request; TEI caps client batches (32 by default).
+    embedding_batch_size: int | None = None
     retrieval_top_k: int = 8
     retrieval_use_mmr: bool = False
+    # Small-to-big: search child chunks, hand the LLM their parent passages.
+    retrieval_expand_parents: bool = True
+    retrieval_max_evidence_tokens: int = 4000
 
     llm_enabled: bool = False
     llm_provider: str = "openai"
@@ -129,20 +144,39 @@ class Settings(BaseSettings):
     paperlens_api_base: str = "http://127.0.0.1:8000"
     cors_allowed_origins: str = (
         "http://127.0.0.1:3000,http://localhost:3000,"
-        "http://127.0.0.1:8080,http://localhost:8080"
+        "http://127.0.0.1:8080,http://localhost:8080,"
+        "https://paperlens.ailearn-vaic.cloud"
     )
-    cors_allow_origin_regex: str = (
-        r"https://paperlens-ui-[a-z0-9-]+\.(?:a\.run\.app|asia-southeast1\.run\.app)"
-    )
-    langsmith_enabled: bool = False
+    cors_allow_origin_regex: str = ""
+    # LangSmith tracing is read by LangChain itself from LANGSMITH_TRACING,
+    # LANGSMITH_API_KEY and LANGSMITH_PROJECT; this mirror is for /health only.
     langsmith_tracing: bool = False
+    # "json" in production: one JSON object per line, with the request id.
+    log_format: Literal["text", "json"] = "text"
+    # CloudWatch Embedded Metric Format lines on stdout (namespace "PaperLens").
+    metrics_enabled: bool = False
     allow_paid_evaluation: bool = False
 
     # Unified agent request/response safety limits (deterministic guardrails).
     agent_max_message_chars: int = 8000
     agent_max_selected_papers: int = 8
     agent_max_image_bytes: int = 2 * 1024 * 1024
-    agent_history_limit: int = 24
+    # Messages kept in the database per conversation (storage cap, not prompt size).
+    agent_history_limit: int = 400
+    # Context engineering (app/harness/memory.py): recent whole turns up to this many
+    # tokens and turns; older turns are folded into a rolling summary.
+    agent_context_recent_tokens: int = 3000
+    agent_context_max_turns: int = 6
+    agent_summary_use_llm: bool = True
+    agent_summary_max_words: int = 150
+    # Summarize once this many dropped turns are waiting (one-line briefs cover them
+    # meanwhile), so long chats cost one summary call per few turns, not per turn.
+    agent_summary_batch_turns: int = 3
+    # Optional cheaper model for summaries and query rewriting (OpenAI API); empty = LLM_MODEL.
+    agent_summary_model: str = ""
+    agent_summary_api_key: str | None = None
+    # Rewrite follow-up / non-English questions into a standalone English retrieval query.
+    qa_query_rewrite: bool = True
     agent_reasoning_enabled: bool = True
     agent_reasoning_effort: Literal["low", "medium", "high"] = "medium"
 

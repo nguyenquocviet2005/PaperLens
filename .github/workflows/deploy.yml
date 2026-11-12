@@ -1,0 +1,123 @@
+name: Deploy
+
+# Every push to master: CI, then the API (if backend code or infra changed) and the
+# UI (if the frontend changed). Fully automatic; safety comes from:
+#   - CI must pass first;
+#   - deploy_aws.py refuses a Terraform plan that touches anything except the API
+#     task definition and service (other infra changes need a local, reviewed apply);
+#   - the ECS circuit breaker rolls back a release whose tasks fail health checks;
+#   - a smoke test hits /health through the public URL.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: What to deploy
+        type: choice
+        options: [both, api, ui]
+        default: both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false # never interrupt a rollout half way
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.diff.outputs.api }}
+      ui: ${{ steps.diff.outputs.ui }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            [ "$TARGET" != "ui" ] && echo "api=true" >> "$GITHUB_OUTPUT"
+            [ "$TARGET" != "api" ] && echo "ui=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! files=$(git diff --name-only "$BEFORE" "$GITHUB_SHA" 2>/dev/null); then
+            echo "No usable previous commit (new branch or force push): deploy both"
+            echo "api=true" >> "$GITHUB_OUTPUT"; echo "ui=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "$files"
+          echo "$files" | grep -Eq '^(src/backend/(app/|pyproject\.toml)|Dockerfile\.backend|infra/prod/)' \
+            && echo "api=true" >> "$GITHUB_OUTPUT"
+          echo "$files" | grep -Eq '^src/frontend/' && echo "ui=true" >> "$GITHUB_OUTPUT"
+          true
+
+  api:
+    name: Deploy API
+    needs: [ci, changes]
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write # OIDC: assume the deploy role without stored AWS keys
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-northeast-1
+          role-session-name: paperlens-deploy-${{ github.run_id }}
+          role-duration-seconds: 7200
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.1"
+          terraform_wrapper: false # deploy_aws.py parses `terraform output -json`
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Terraform init
+        run: terraform -chdir=infra/prod init -input=false -lockfile=readonly
+
+      - name: Build, release and smoke test
+        env:
+          # Shared settings come from the committed release.auto.tfvars; the alarm
+          # email (gitignored prod.auto.tfvars locally) comes from a secret. If it is
+          # missing, the plan would drop the email subscription and the guard stops.
+          TF_VAR_alarm_email: ${{ secrets.TF_VAR_ALARM_EMAIL }}
+        run: python src/ops/deploy_aws.py api --yes
+
+  ui:
+    name: Deploy UI
+    needs: [ci, changes, api]
+    # After the API (when both changed) so the UI never calls an API it predates.
+    if: >-
+      !cancelled() && needs.ci.result == 'success' && needs.changes.outputs.ui == 'true'
+      && (needs.api.result == 'success' || needs.api.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --global vercel@65.14.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
+        run: python src/ops/deploy_aws.py ui

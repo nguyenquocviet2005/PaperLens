@@ -71,7 +71,7 @@ def main() -> None:
         },
     )
     print("SUPABASE_JWT_SECRET_PRESENT", bool(vals.get("SUPABASE_JWT_SECRET")))
-    for key in ("SUPABASE_URL", "SUPABASE_BACKEND", "STORAGE_BACKEND", "GCS_BUCKET_NAME"):
+    for key in ("SUPABASE_URL", "SUPABASE_BACKEND", "STORAGE_BACKEND", "S3_BUCKET_NAME"):
         if key not in vals:
             print(key, "MISSING")
             continue

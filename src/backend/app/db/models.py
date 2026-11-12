@@ -186,6 +186,13 @@ class AgentConversation(Base):
     user_id: Mapped[str] = mapped_column(String(64), nullable=False, default="local-user", index=True)
     title: Mapped[str | None] = mapped_column(String(512), nullable=True)
     selected_papers: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    # "agent" (main chat) or "qa" (single-paper /papers/{id}/qa chat).
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="agent")
+    # Rolling summary of the oldest `summarized_turns` turns and structured state
+    # (app/harness/memory.py). Context for the model, never a citation source.
+    context_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    summarized_turns: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    context_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow

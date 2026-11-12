@@ -69,6 +69,39 @@ def _cmd_db_info(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_reindex(args: argparse.Namespace) -> int:
+    """Re-chunk and re-index stored papers with the current chunking/context rules."""
+    from sqlalchemy import select
+
+    from app.config import get_settings
+    from app.db.models import Paper
+    from app.db.session import reset_engine, session_scope
+    from app.ingestion.pipeline import rebuild_paper_index
+
+    clear = getattr(get_settings, "cache_clear", None)
+    if callable(clear):
+        clear()
+    reset_engine()
+    settings = get_settings()
+    if args.paper_id:
+        paper_ids = list(args.paper_id)
+    else:
+        with session_scope(settings) as session:
+            paper_ids = list(session.scalars(select(Paper.id).where(Paper.status == "completed")))
+    failures = 0
+    for paper_id in paper_ids:
+        try:
+            summary = rebuild_paper_index(
+                paper_id, settings=settings, refresh_context=not args.keep_context, enrich=args.enrich
+            )
+            print(json.dumps({k: v for k, v in summary.items() if k != "index"}))
+        except Exception as exc:
+            failures += 1
+            print(f"{paper_id}: FAILED ({type(exc).__name__})")
+    print(f"Re-indexed {len(paper_ids) - failures}/{len(paper_ids)} papers")
+    return 1 if failures else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description="PaperLens CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -81,6 +114,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_info = sub.add_parser("db-info", help="Print redacted database URL classification")
     p_info.set_defaults(func=_cmd_db_info)
+
+    p_reindex = sub.add_parser(
+        "reindex", help="Re-chunk and re-index stored papers (small-to-big, table data, context)"
+    )
+    p_reindex.add_argument("--paper-id", action="append", help="Only this paper (repeatable)")
+    p_reindex.add_argument(
+        "--enrich", action="store_true", help="Also run Luna on visuals (one VLM request each)"
+    )
+    p_reindex.add_argument(
+        "--keep-context", action="store_true", help="Do not recompute surrounding text"
+    )
+    p_reindex.set_defaults(func=_cmd_reindex)
 
     return parser
 

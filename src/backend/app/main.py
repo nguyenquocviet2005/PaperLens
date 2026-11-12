@@ -10,16 +10,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import __version__
 from app.config import get_settings
 from app.db.session import init_db
+from app.infrastructure.observability import RequestContextMiddleware, configure_logging
 from app.ingestion.parser import apply_thread_limits
 from app.routes import router
 
 settings = get_settings()
 apply_thread_limits(settings.docling_threads)
-
-logging.basicConfig(
-    level=getattr(logging, settings.log_level.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+configure_logging(settings)
 
 app = FastAPI(
     title="PaperLens",
@@ -29,23 +26,29 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_origin_regex=settings.cors_allow_origin_regex,
+    allow_origin_regex=settings.cors_allow_origin_regex or None,
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+# Outermost, so the request id and timing cover CORS handling and errors too.
+app.add_middleware(RequestContextMiddleware)
 app.include_router(router)
 
 
 @app.on_event("startup")
 def _startup() -> None:
     logging.getLogger(__name__).info(
-        "PaperLens starting env=%s storage=%s db=%s luna_enabled=%s allow_external_api=%s",
+        "PaperLens starting env=%s storage=%s db=%s luna_enabled=%s allow_external_api=%s "
+        "metrics=%s langsmith=%s",
         settings.app_env,
         settings.storage_backend,
         settings.database_url.split("://", 1)[0],
         settings.luna_enabled,
         settings.allow_external_api,
+        settings.metrics_enabled,
+        settings.langsmith_tracing,
     )
     try:
         init_db(settings)

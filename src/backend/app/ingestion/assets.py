@@ -11,6 +11,7 @@ from PIL import Image
 from app.config import Settings, get_settings
 from app.schemas import BoundingBox, VisualElement
 from app.infrastructure.storage import StorageBackend, paper_asset_key
+from app.ingestion.surrounding import build_document_index, select_surrounding_text
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,6 @@ def _get_page_image(document: Any, page_no: int | None) -> Image.Image | None:
     if pil is not None:
         return pil
     # Some versions expose bytes / URI
-    data = getattr(image, "uri", None)
     if hasattr(image, "pil_image"):
         return image.pil_image
     return None
@@ -134,29 +134,37 @@ def _page_size(document: Any, page_no: int | None) -> tuple[float | None, float 
     return getattr(size, "width", None), getattr(size, "height", None)
 
 
-def _surrounding_text(document: Any, page: int | None, order_index: int, window: int = 2) -> list[str]:
-    texts: list[tuple[int, int | None, str]] = []
-    idx = 0
-    for item, _level in document.iterate_items():
-        idx += 1
-        text = _text_of(item)
-        if not text:
-            continue
-        prov = getattr(item, "prov", None) or []
-        item_page = getattr(prov[0], "page_no", None) if prov else None
-        if type(item).__name__ in {"TableItem", "PictureItem", "FormulaItem"}:
-            continue
-        texts.append((idx, item_page, text))
+def _embedder(cfg: Settings):
+    """Embedding function for ranking context paragraphs; disabled after the first failure."""
+    if not cfg.surrounding_text_use_embeddings:
+        return None
+    try:
+        from app.rag.embeddings import get_embeddings
 
-    nearby: list[str] = []
-    for idx, item_page, text in texts:
-        if page is not None and item_page is not None and item_page != page:
-            continue
-        if abs(idx - order_index) <= window * 3 and idx != order_index:
-            nearby.append(text)
-        if len(nearby) >= window * 2:
-            break
-    return nearby[: window * 2]
+        model, _name = get_embeddings(cfg)
+    except Exception as exc:
+        logger.warning("Surrounding-text embeddings unavailable: %s", type(exc).__name__)
+        return None
+    state = {"ok": True}
+
+    def embed(texts):
+        if not state["ok"]:
+            raise RuntimeError("embeddings disabled after an earlier failure")
+        try:
+            return model.embed_documents(list(texts))
+        except Exception:
+            state["ok"] = False
+            raise
+
+    return embed
+
+
+def _table_markdown(item: Any, document: Any) -> str | None:
+    try:
+        markdown = item.export_to_markdown(doc=document)
+    except Exception:
+        return None
+    return markdown.strip() or None
 
 
 def _caption_for(item: Any, document: Any | None = None) -> str | None:
@@ -228,6 +236,19 @@ def extract_assets(
 
     order = 0
     table_idx = figure_idx = formula_idx = 0
+    context_index = build_document_index(document)
+    embed = _embedder(cfg)
+
+    def context(kind: str, item: Any, caption: str | None, page: int | None) -> list[str]:
+        return select_surrounding_text(
+            context_index,
+            kind=kind,
+            caption=caption,
+            source_ref=getattr(item, "self_ref", None),
+            page=page,
+            budget_tokens=cfg.surrounding_text_max_tokens,
+            embed=embed,
+        )
 
     # Collect picture-internal text refs
     picture_children: dict[str, list[str]] = {}
@@ -302,11 +323,11 @@ def extract_assets(
                     type="table",
                     page=page,
                     caption=caption,
-                    surrounding_text=_surrounding_text(document, page, order),
+                    surrounding_text=context("table", item, caption, page),
                     bbox=bbox,
                     image_uri=image_uri,
                     structured_data_uri=structured_uri,
-                    docling_text=None,
+                    docling_text=_table_markdown(item, document),
                     needs_enrichment=False,
                     source_ref=getattr(item, "self_ref", None),
                     order=order,
@@ -352,7 +373,7 @@ def extract_assets(
                     type="figure",
                     page=page,
                     caption=caption,
-                    surrounding_text=_surrounding_text(document, page, order),
+                    surrounding_text=context("figure", item, caption, page),
                     bbox=bbox,
                     image_uri=image_uri,
                     docling_text=None,
@@ -395,7 +416,7 @@ def extract_assets(
                     type="formula",
                     page=page,
                     caption=None,
-                    surrounding_text=_surrounding_text(document, page, order),
+                    surrounding_text=context("formula", item, None, page),
                     bbox=bbox,
                     image_uri=image_uri,
                     docling_text=text or None,

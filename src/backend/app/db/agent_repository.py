@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.models import AgentConversation, AgentMessage
@@ -13,6 +13,21 @@ from app.db.models import AgentConversation, AgentMessage
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _message_row(conversation_id: str, order_index: int, item: dict[str, Any]) -> AgentMessage:
+    return AgentMessage(
+        conversation_id=conversation_id,
+        order_index=order_index,
+        role=str(item.get("role") or "human"),
+        content=str(item.get("content") or ""),
+        tool_name=item.get("tool_name"),
+        tool_call_id=item.get("tool_call_id"),
+        tool_calls=item.get("tool_calls"),
+        artifact=item.get("artifact"),
+        status=item.get("status"),
+        message_metadata=item.get("message_metadata"),
+    )
 
 
 class AgentConversationRepository:
@@ -79,6 +94,72 @@ class AgentConversationRepository:
         self.session.flush()
         return bool(result.rowcount)
 
+    def append_messages(
+        self,
+        conversation_id: str,
+        records: list[dict[str, Any]],
+        *,
+        selected_papers: list[str] | None = None,
+        user_id: str = "local-user",
+        kind: str = "agent",
+        max_messages: int = 400,
+    ) -> AgentConversation:
+        """Append one turn's messages (no rewrite of earlier rows).
+
+        Earlier rows are only deleted past `max_messages`, oldest first; prompt-size
+        trimming happens when the prompt is built, never here.
+        """
+        conversation = self.get_or_create(
+            conversation_id, selected_papers=selected_papers, user_id=user_id
+        )
+        last_index = self.session.scalar(
+            select(func.max(AgentMessage.order_index)).where(
+                AgentMessage.conversation_id == conversation_id
+            )
+        )
+        start = 0 if last_index is None else last_index + 1
+        if start == 0:
+            conversation.kind = kind
+        for offset, item in enumerate(records):
+            self.session.add(_message_row(conversation_id, start + offset, item))
+        if not conversation.title:
+            first_human = next(
+                (str(item.get("content") or "").strip() for item in records if item.get("role") == "human"),
+                "",
+            )
+            conversation.title = first_human[:80] or "New conversation"
+        conversation.updated_at = _utcnow()
+        self.session.flush()
+        total = start + len(records)
+        if max_messages and total > max_messages:
+            self.session.execute(
+                delete(AgentMessage).where(
+                    AgentMessage.conversation_id == conversation_id,
+                    AgentMessage.order_index < total - max_messages,
+                )
+            )
+            self.session.flush()
+        return conversation
+
+    def update_memory(
+        self,
+        conversation_id: str,
+        *,
+        state: dict[str, Any] | None = None,
+        summary: str | None = None,
+        summarized_turns: int | None = None,
+    ) -> None:
+        conversation = self.session.get(AgentConversation, conversation_id)
+        if conversation is None:
+            return
+        if state is not None:
+            conversation.context_state = state
+        if summary is not None:
+            conversation.context_summary = summary
+        if summarized_turns is not None:
+            conversation.summarized_turns = summarized_turns
+        self.session.flush()
+
     def replace_messages(
         self,
         conversation_id: str,
@@ -99,20 +180,7 @@ class AgentConversationRepository:
 
         trimmed = records[-keep_last:] if keep_last > 0 else records
         for idx, item in enumerate(trimmed):
-            conversation.messages.append(
-                AgentMessage(
-                    conversation_id=conversation_id,
-                    order_index=idx,
-                    role=str(item.get("role") or "human"),
-                    content=str(item.get("content") or ""),
-                    tool_name=item.get("tool_name"),
-                    tool_call_id=item.get("tool_call_id"),
-                    tool_calls=item.get("tool_calls"),
-                    artifact=item.get("artifact"),
-                    status=item.get("status"),
-                    message_metadata=item.get("message_metadata"),
-                )
-            )
+            conversation.messages.append(_message_row(conversation_id, idx, item))
         if not conversation.title:
             first_human = next(
                 (str(item.get("content") or "").strip() for item in records if item.get("role") == "human"),
