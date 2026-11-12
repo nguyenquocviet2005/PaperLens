@@ -89,10 +89,10 @@ variable "langsmith_project" {
   default     = "paperlens-prod"
 }
 
-variable "github_repository" {
-  description = "owner/name of the GitHub repository allowed to deploy through OIDC"
+variable "github_oidc_subject_prefix" {
+  description = "Subject prefix of the repository's OIDC tokens; see `gh api repos/OWNER/REPO/actions/oidc/customization/sub` (sub_claim_prefix)"
   type        = string
-  default     = "nguyenquocviet2005/PaperLens"
+  default     = "repo:nguyenquocviet2005@167674246/PaperLens@1441673161"
 }
 
 variable "github_deploy_branch" {

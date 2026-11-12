@@ -22,10 +22,12 @@ data "aws_iam_policy_document" "github_assume" {
       values   = ["sts.amazonaws.com"]
     }
     # Only pushes to the deploy branch: pull requests and other branches cannot deploy.
+    # The repository uses GitHub's immutable subject format (owner and repo numeric ids),
+    # so a renamed or re-created repository with the same name cannot match.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repository}:ref:refs/heads/${var.github_deploy_branch}"]
+      values   = ["${var.github_oidc_subject_prefix}:ref:refs/heads/${var.github_deploy_branch}"]
     }
   }
 }
